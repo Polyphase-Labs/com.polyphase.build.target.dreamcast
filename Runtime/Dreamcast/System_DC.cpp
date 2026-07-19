@@ -99,11 +99,25 @@ void SYS_SetWorkingDirectory(const std::string& /*dirPath*/) {}
 // File I/O (newlib stdio — KOS maps /cd, /ram, /pc, /vmu transparently)
 // =========================================================================
 
+// Resolve an engine path to a KOS VFS path. The engine hands paths relative to
+// the app root — "Config.ini", "BuildTarget-Dreamcast/Assets/...",
+// "Engine/Assets/..." — and on the Dreamcast the app root is the disc mounted at
+// /cd/. Absolute paths (/cd/, /vmu/, /ram/) pass through unchanged so VMU saves
+// keep working. Without this, ReadEngineConfig never finds Config.ini, no project
+// is loaded, and no scene/assets are discovered.
+static std::string DcResolvePath(const char* path)
+{
+    if (path == nullptr || path[0] == '\0') return std::string();
+    if (path[0] == '/') return std::string(path);
+    return std::string("/cd/") + path;
+}
+
 bool SYS_DoesFileExist(const char* path, bool /*isAsset*/)
 {
     if (path == nullptr) return false;
+    const std::string full = DcResolvePath(path);
     struct stat st;
-    return stat(path, &st) == 0;
+    return stat(full.c_str(), &st) == 0;
 }
 
 void SYS_AcquireFileData(const char* path, bool /*isAsset*/, int32_t maxSize,
@@ -113,10 +127,11 @@ void SYS_AcquireFileData(const char* path, bool /*isAsset*/, int32_t maxSize,
     outSize = 0;
     if (path == nullptr) return;
 
-    FILE* f = fopen(path, "rb");
+    const std::string full = DcResolvePath(path);
+    FILE* f = fopen(full.c_str(), "rb");
     if (f == nullptr)
     {
-        LogWarning("SYS_AcquireFileData: fopen failed for '%s'", path);
+        LogWarning("SYS_AcquireFileData: fopen failed for '%s'", full.c_str());
         return;
     }
 
@@ -173,7 +188,7 @@ void SYS_OpenDirectory(const std::string& dirPath, DirEntry& outDirEntry)
     outDirEntry.mDirDrain = nullptr;
     outDirEntry.mDirIndex = 0;
 
-    DIR* dir = opendir(dirPath.c_str());
+    DIR* dir = opendir(DcResolvePath(dirPath.c_str()).c_str());
     if (dir == nullptr) return;
 
     DirDrain* drain = new DirDrain();

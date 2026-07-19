@@ -56,6 +56,40 @@ they load from the disc (`/cd/`) at runtime.
 
 ---
 
+## Booting the build (selfboot)
+
+A Build produces two things under the project's `Packaged/` folder:
+
+1. **`homebrew.dreamcast/<name>.cdi`** — an auto-generated CDI (scramble → makeip →
+   `mkisofs -C 0,11702` → `cdi4dc`). This boots under **flycast with its default HLE
+   BIOS (REIOS)** — just open the `.cdi` in flycast. Good for quick iteration.
+
+2. **`selfboot/`** — a folder holding `1ST_READ.BIN` (the scrambled boot binary) plus
+   the cooked assets. Use this to make an image the **retail BIOS / real hardware**
+   will self-boot (REIOS-only CDIs get dropped to the CD-player screen by a real BIOS).
+
+**Mastering a real-BIOS CDI with BootDreams** (ships with DreamSDK,
+`opt/dreamsdk/tools/bdreams/BootDreams.exe`):
+
+1. Launch **BootDreams**, choose the **DiscJuggler** (CDI) target.
+2. **Selfboot folder** → point at the project's `Packaged/selfboot/`.
+3. **CD Label** → any name (e.g. `POLYPHASE`); **Disc format** → **Audio/Data**.
+4. **Process** → writes a self-boot `.cdi`. If it prompts *"missing IP.BIN, create
+   one?"* answer **Yes**.
+5. Load that `.cdi` in flycast with a **real BIOS** (`dc_boot.bin`/`dc_flash.bin` in
+   flycast's `data/`, HLE BIOS off) — or burn to a **CD-RW** for real hardware.
+
+For live debugging, enable flycast's **Serial Console**: `Main_DC` routes the engine
+log to the SCIF serial port (`dbgio_dev_select("scif")`), so the boot log and any
+`*** SH4 EXCEPTION *** PC=…` from the exception handler appear there. Map a fault PC
+to source with `sh-elf-addr2line -e Build/Dreamcast/<name>.elf <pc>`.
+
+> Regenerate BOTH artifacts each build — the editor Build / `PostPackage` does this.
+> When re-mastering by hand, the `selfboot/` folder must be refreshed too, not just
+> the `.cdi`.
+
+---
+
 ## Hardware notes
 
 | | |

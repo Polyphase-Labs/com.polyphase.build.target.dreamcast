@@ -28,6 +28,16 @@
 #include "EmbeddedFile.h"
 #include "Log.h"
 
+// Phase-2 bring-up demo scene (spawned only when the project has no scene of its
+// own, i.e. no active camera). Exercises the real engine mesh render path.
+#include "Engine/Renderer.h"
+#include "Engine/World.h"
+#include "Engine/AssetManager.h"
+#include "Engine/Vertex.h"
+#include "Engine/Assets/StaticMesh.h"
+#include "Engine/Nodes/3D/StaticMesh3d.h"
+#include "Engine/Nodes/3D/Camera3d.h"
+
 // Standard KOS init: threads + maple (controllers) + default drivers. PVR is
 // initialised by Graphics_PVR2::GFX_Initialize, not here, so it isn't in the
 // flag set.
@@ -69,6 +79,72 @@ void OctPreInitialize(EngineConfig& config)
     config.mEmbeddedScripts     = gEmbeddedScripts;
 }
 
+// Phase-2 bring-up: when the loaded project has NO scene of its own (no active
+// camera), spawn a rotating shaded cube + camera so the real engine mesh render
+// path (GFX_CreateStaticMeshResource + GFX_DrawStaticMeshComp) is exercised.
+// A project that ships a scene is untouched (the early-out below). Remove when
+// projects reliably provide their own scenes.
+static StaticMesh3D* sDemoMeshNode = nullptr;
+
+static void DcSpawnDemoScene()
+{
+    // GetWorld(0) is the persistent primary world (created at Initialize); the
+    // Renderer's "current world" isn't set until the render loop runs, so use the
+    // global accessor here at post-init time.
+    World* world = GetWorld(0);
+    if (world == nullptr) { LogWarning("[DC] demo scene: no world"); return; }
+    if (world->GetActiveCamera() != nullptr) return;   // project provided a scene
+
+    static const glm::vec3 P[8] = {
+        {-1,-1,-1}, { 1,-1,-1}, { 1, 1,-1}, {-1, 1,-1},
+        {-1,-1, 1}, { 1,-1, 1}, { 1, 1, 1}, {-1, 1, 1},
+    };
+    struct Face { glm::vec3 n; uint32_t col; int i[4]; };
+    auto RGBA = [](uint32_t r, uint32_t g, uint32_t b) -> uint32_t {
+        return r | (g << 8) | (b << 16) | 0xFF000000u;   // engine packs R low byte
+    };
+    const Face F[6] = {
+        {{ 0, 0,  1}, RGBA(230, 70, 70),  {4, 5, 6, 7}},
+        {{ 0, 0, -1}, RGBA(70, 200, 70),  {1, 0, 3, 2}},
+        {{ 1, 0,  0}, RGBA(80, 120, 230), {5, 1, 2, 6}},
+        {{-1, 0,  0}, RGBA(230, 210, 70), {0, 4, 7, 3}},
+        {{ 0, 1,  0}, RGBA(70, 210, 210), {7, 6, 2, 3}},
+        {{ 0,-1,  0}, RGBA(210, 70, 210), {0, 1, 5, 4}},
+    };
+
+    VertexColor verts[24];
+    IndexType   indices[36];
+    for (int f = 0; f < 6; ++f)
+    {
+        for (int k = 0; k < 4; ++k)
+        {
+            VertexColor& v = verts[f * 4 + k];
+            v.mPosition  = P[F[f].i[k]];
+            v.mTexcoord0 = glm::vec2(0.0f);
+            v.mTexcoord1 = glm::vec2(0.0f);
+            v.mNormal    = F[f].n;
+            v.mColor     = F[f].col;
+        }
+        const int b = f * 4, o = f * 6;
+        indices[o + 0] = b + 0; indices[o + 1] = b + 1; indices[o + 2] = b + 2;
+        indices[o + 3] = b + 0; indices[o + 4] = b + 2; indices[o + 5] = b + 3;
+    }
+
+    StaticMesh* mesh = NewTransientAsset<StaticMesh>();
+    mesh->CreateRawColor(24, verts, 36, indices);   // sets data + Create() -> GFX upload
+
+    Camera3D* cam = world->SpawnNode<Camera3D>(glm::vec3(0.0f, 0.0f, 10.0f));
+    cam->SetPosition(glm::vec3(0.0f, 0.0f, 10.0f));   // explicit, in case spawn arg isn't applied
+    world->SetActiveCamera(cam);
+
+    StaticMesh3D* node = world->SpawnNode<StaticMesh3D>(glm::vec3(0.0f, 0.0f, 0.0f));
+    node->SetStaticMesh(mesh);
+    node->SetRotation(glm::vec3(20.0f, 30.0f, 0.0f));   // tilt so three faces show
+    sDemoMeshNode = node;
+
+    LogDebug("[DC] Phase-2 demo scene spawned (cube + camera)");
+}
+
 void OctPostInitialize()
 {
     // ReadEngineConfig (inside GameMain) reloads Config.ini AFTER
@@ -82,9 +158,16 @@ void OctPostInitialize()
     GetEngineState()->mWindowWidth  = 640;
     GetEngineState()->mWindowHeight = 480;
     LogDebug("[DC] OctPostInitialize: window %ux%u -> 640x480", beforeW, beforeH);
+
+    DcSpawnDemoScene();
 }
 
-void OctPreUpdate() {}
+void OctPreUpdate()
+{
+    // Spin the demo cube (no-op when a real scene is present).
+    if (sDemoMeshNode != nullptr)
+        sDemoMeshNode->AddRotation(glm::vec3(0.5f, 0.8f, 0.0f));
+}
 void OctPostUpdate() {}
 void OctPreShutdown() {}
 void OctPostShutdown() {}
