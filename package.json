@@ -1,0 +1,22 @@
+{
+    "name": "com.polyphase.build.target.dreamcast",
+    "author": "Justin Jaro",
+    "description": "Adds a 'Dreamcast (KallistiOS)' build target to the Polyphase editor. Routes the compile/package/run pipeline through a user-selectable toolchain: DreamSDK (Windows, via dreamsdk-runner.exe), a native KallistiOS install ($KOS_BASE + environ.sh), or KallistiOS inside WSL. Compiles the engine + Runtime/Dreamcast into a KOS .elf, wraps it into a .cdi/.gdi with mkdcdisc, and launches in flycast/lxdream/redream or deploys to hardware via dc-tool-ip. Ships a Variant-2 engine runtime (Runtime/Dreamcast) plus Makefile_Dreamcast.",
+    "version": "1.0.0",
+    "native": {
+        "target": "editor",
+        "sourceDir": "Source",
+        "binaryName": "com.polyphase.build.target.dreamcast",
+        "entrySymbol": "PolyphasePlugin_GetDesc",
+        "apiVersion": 4,
+        "resolveMode": "source",
+        "buildTargets": [
+            {
+                "id": "homebrew.dreamcast",
+                "displayName": "Dreamcast (KallistiOS)",
+                "category": "Retro Consoles"
+            }
+        ],
+        "binaries": []
+    }
+}

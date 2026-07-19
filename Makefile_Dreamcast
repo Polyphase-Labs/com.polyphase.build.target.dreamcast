@@ -1,0 +1,280 @@
+# Makefile_Dreamcast — Polyphase Dreamcast build (Phase 1: engine compiles + boots).
+#
+# Single-pass build: compiles the engine source tree + the Dreamcast addon
+# runtime (Runtime/Dreamcast) + the project's own Source into one KOS .elf.
+# Mirrors Makefile_PSP but uses the KallistiOS toolchain (kos-c++ / sh-elf-g++).
+#
+# Run via the editor's Dreamcast build-target addon (which sources the KOS
+# environment through DreamSDK's runner or $KOS_BASE/environ.sh, then invokes
+# this from <projectDir>/Intermediate/Dreamcast/), OR manually inside a shell
+# that has the KOS environment sourced:
+#
+#   . $KOS_BASE/environ.sh
+#   make -C <projectDir> -f Makefile_Dreamcast PROJECT_ROOT=<projectDir> -j4
+#
+# Requires KallistiOS: KOS_BASE set and kos-c++/kos-cc on PATH (DreamSDK's
+# dreamsdk-runner sets these up automatically).
+
+# Delete partial outputs on failure so a stale 0-byte .o can't satisfy the next
+# build's freshness check and silently break the link. (See Makefile_PSP.)
+.DELETE_ON_ERROR:
+
+# ---- Project root resolution ------------------------------------------------
+# 1. PROJECT_ROOT set on the make command line by the addon's GetCompileCommand.
+# 2. Walk up from CURDIR for a *.octp marker (manual `make -C` or Intermediate/).
+ifeq ($(origin PROJECT_ROOT), undefined)
+PROJECT_ROOT := $(strip \
+    $(if $(wildcard $(CURDIR)/*.octp),         $(CURDIR), \
+    $(if $(wildcard $(CURDIR)/../*.octp),      $(abspath $(CURDIR)/..), \
+    $(if $(wildcard $(CURDIR)/../../*.octp),   $(abspath $(CURDIR)/../..), \
+                                                ))))
+endif
+
+ifeq ($(strip $(PROJECT_ROOT)),)
+$(error Could not locate project root — no *.octp within 2 levels of $(CURDIR). \
+  Pass PROJECT_ROOT=/path/to/project on the make line.)
+endif
+
+# Strip trailing slash. `override` is REQUIRED — a command-line PROJECT_ROOT
+# beats a plain `:=` reassignment, so without override the patsubst is a no-op
+# and a trailing slash makes $(notdir) return empty -> ".elf" link target.
+override PROJECT_ROOT := $(patsubst %/,%,$(PROJECT_ROOT))
+
+ifeq ($(wildcard $(PROJECT_ROOT)/*.octp),)
+$(error Resolved PROJECT_ROOT='$(PROJECT_ROOT)' but it has no *.octp file. \
+  Pass PROJECT_ROOT explicitly on the make line.)
+endif
+
+# TARGET is the project name — directory name of PROJECT_ROOT (NOT CURDIR,
+# which is Intermediate/Dreamcast under the out-of-tree invocation).
+TARGET = $(notdir $(PROJECT_ROOT))
+
+# ---- Engine path resolution -------------------------------------------------
+POLYPHASE_PATH ?= $(shell \
+    p=$(PROJECT_ROOT); \
+    for i in 1 2 3 4 5 6; do \
+        p=$$(dirname $$p); \
+        if [ -f $$p/Polyphase.sln ]; then echo $$p; exit 0; fi; \
+    done; \
+    echo /opt/Polyphase )
+
+override POLYPHASE_PATH := $(patsubst %/,%,$(POLYPHASE_PATH))
+
+ifeq ($(wildcard $(POLYPHASE_PATH)/Engine/Source/Engine/Engine.h),)
+$(error POLYPHASE_PATH='$(POLYPHASE_PATH)' does not contain Engine/Source/Engine/Engine.h. \
+  Pass POLYPHASE_PATH=/path/to/polyphase-engine on the make line (the editor's Dreamcast \
+  addon does this automatically).)
+endif
+
+# ---- KallistiOS toolchain ---------------------------------------------------
+# The addon's generated build script sources $KOS_BASE/environ.sh (or DreamSDK's
+# runner sets the env) before invoking make, so KOS_BASE + kos-c++ are present.
+ifeq ($(strip $(KOS_BASE)),)
+$(error KOS_BASE is not set. Source your KallistiOS environment first: \
+  `. $$KOS_BASE/environ.sh` (native/WSL), or let the DreamSDK toolchain route \
+  handle it. The editor's Dreamcast addon does this automatically.)
+endif
+
+ADDON_DC_RUNTIME = $(PROJECT_ROOT)/Packages/com.polyphase.build.target.dreamcast/Runtime/Dreamcast
+
+# ---- Engine-native addon injection ------------------------------------------
+# The editor writes Generated/AddonInject.mk before compiling; it DEFINEs
+# ADDON_SOURCES / ADDON_DEFINES / ADDON_INCDIR / ADDON_LIBDIR / ADDON_LIBS /
+# ADDON_CPPFILES_EXTRA for engine-target addons. `-include` is non-fatal.
+-include $(PROJECT_ROOT)/Generated/AddonInject.mk
+
+# ---- Source discovery -------------------------------------------------------
+SOURCES = \
+    $(POLYPHASE_PATH)/Engine/Source/Engine \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Assets \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Animation \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Nodes \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Nodes/3D \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Nodes/Widgets \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/NodeGraph \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/NodeGraph/Nodes \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/NodeGraph/Domains \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/UI \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Timeline \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Timeline/Tracks \
+    $(POLYPHASE_PATH)/Engine/Source/Plugins \
+    $(POLYPHASE_PATH)/Engine/Source/System \
+    $(POLYPHASE_PATH)/Engine/Source/Graphics \
+    $(POLYPHASE_PATH)/Engine/Source/Input \
+    $(POLYPHASE_PATH)/Engine/Source/Audio \
+    $(POLYPHASE_PATH)/Engine/Source/Network \
+    $(POLYPHASE_PATH)/Engine/Source/Network/Http \
+    $(POLYPHASE_PATH)/Engine/Source/Network/Http/Backends \
+    $(POLYPHASE_PATH)/Engine/Source/Serial/Stub \
+    $(POLYPHASE_PATH)/Engine/Source/LuaBindings \
+    $(POLYPHASE_PATH)/External/Lua \
+    $(POLYPHASE_PATH)/External/Vorbis \
+    $(POLYPHASE_PATH)/External/IrrXML \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/BroadphaseCollision \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/CollisionDispatch \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/CollisionShapes \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/Gimpact \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/NarrowPhaseCollision \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/Character \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/ConstraintSolver \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/Dynamics \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/Featherstone \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/MLCPSolvers \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/Vehicle \
+    $(POLYPHASE_PATH)/External/Bullet/LinearMath \
+    $(POLYPHASE_PATH)/External/recastnavigation/Recast/Source \
+    $(POLYPHASE_PATH)/External/recastnavigation/Detour/Source \
+    $(ADDON_DC_RUNTIME) \
+    $(ADDON_DC_RUNTIME)/Graphics_PVR2 \
+    $(PROJECT_ROOT)/Source \
+    $(ADDON_SOURCES)
+
+# ---- Include path -----------------------------------------------------------
+INCDIR = \
+    $(PROJECT_ROOT)/Generated \
+    $(ADDON_DC_RUNTIME) \
+    $(ADDON_DC_RUNTIME)/Graphics_PVR2 \
+    $(POLYPHASE_PATH)/Engine/Source \
+    $(POLYPHASE_PATH)/Engine/Source/Engine \
+    $(POLYPHASE_PATH)/External \
+    $(POLYPHASE_PATH)/External/Bullet \
+    $(POLYPHASE_PATH)/External/Lua \
+    $(POLYPHASE_PATH)/External/glm \
+    $(POLYPHASE_PATH)/External/Vorbis \
+    $(POLYPHASE_PATH)/External/Assimp/contrib/rapidjson \
+    $(POLYPHASE_PATH)/External/recastnavigation/Recast/Include \
+    $(POLYPHASE_PATH)/External/recastnavigation/Detour/Include \
+    $(POLYPHASE_PATH)/Engine/External/PolyVox/include \
+    $(ADDON_INCDIR)
+
+# ---- Object list ------------------------------------------------------------
+# Flat-basename objects in CWD (Intermediate/Dreamcast); VPATH resolves the
+# original source dir. Two same-basename files in different dirs would collide;
+# the engine's subsystem files use distinct names so this is safe today.
+CPPFILES := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
+CFILES   := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
+
+# Pull in ONLY the embedded-scripts blob from Generated/. EmbeddedAssets.cpp
+# (tens of MB of cooked bytes) would blow past Dreamcast's 16 MB RAM ceiling;
+# assets load from the disc (/cd/) at runtime via AssetManager::Discover. Lua
+# scripts only ship embedded, so this one file IS needed.
+ifneq ($(wildcard $(PROJECT_ROOT)/Generated/EmbeddedScripts.cpp),)
+CPPFILES += EmbeddedScripts.cpp
+endif
+
+# Engine-target addon registrar + any other generated CPP from AddonInject.mk.
+CPPFILES += $(ADDON_CPPFILES_EXTRA)
+
+# Enlarge the KOS main/kernel-thread stack from 64 KB to 512 KB: recompile the
+# three KOS source files that reference THD_KERNEL_STACK_SIZE (overridden in
+# DEFINES below) so our objects replace the libkallisti copies. KOS's default
+# 64 KB kernel stack is too small for the engine's C++ static initialisers (the
+# PSP port gives the main thread 256 KB). thread.c sizes the stack, mm.c reserves
+# it from the heap, stack.c bounds the GC scanner — all three must agree.
+#
+# These get DISTINCT object names (kosovr_*) built by explicit rules below — NOT
+# via VPATH + a bare `thread.o`. KOS builds in-tree, leaving a prebuilt
+# thread.o/mm.o/stack.o next to each .c; a bare `thread.o` target resolves
+# through VPATH to that stale in-tree object ("is up to date"), so our recompile
+# never runs and the link fails ("cannot find thread.o"). Distinct names + full
+# source paths sidestep VPATH entirely. On the link line (before kos-c++'s
+# implicit -lkallisti) these objects define the same symbols as the archive's
+# thread.o/mm.o/stack.o, so they win and the archive members are never pulled
+# (no multiple-definition).
+KOS_OVERRIDE_OBJS = kosovr_thread.o kosovr_mm.o kosovr_stack.o
+
+VPATH := $(SOURCES) $(PROJECT_ROOT)/Generated
+OBJS  := $(CPPFILES:.cpp=.o) $(CFILES:.c=.o) $(KOS_OVERRIDE_OBJS)
+
+# ---- Flags ------------------------------------------------------------------
+# Variant-2 platform-extension flag + DC-native macros. AUDIO_ANALYSIS_ENABLED=0
+# keeps the FFT/ring-buffer machinery out of the 16 MB budget (no streaming
+# visualizers in the Phase-1 skeleton).
+# KOS main/kernel-thread stack size (bytes). Only the kosovr_* override objects
+# consume it (via -D on their compile rules) — keeping it OUT of the global
+# DEFINES means changing it recompiles just those 3 files + relink, not the whole
+# engine. See dreamcast-kernel-stack-override memory. Override on the make line:
+#   make ... KERNEL_STACK=3145728
+KERNEL_STACK ?= 524288
+
+DEFINES = \
+    -DPOLYPHASE_PLATFORM_ADDON=1 \
+    -DPLATFORM_DREAMCAST=1 \
+    -DAPI_PVR2=1 \
+    -DEDITOR=0 \
+    -DLUA_ENABLED=1 \
+    -DGLM_FORCE_RADIANS \
+    -DLOGGING_ENABLED=1 \
+    -DAUDIO_ANALYSIS_ENABLED=0 \
+    $(ADDON_DEFINES)
+
+INCFLAGS = $(addprefix -I,$(INCDIR))
+
+# kos-c++ / kos-cc prepend the KallistiOS include/lib flags automatically, so we
+# only add engine flags here. -fno-exceptions/-fno-rtti match the other console
+# targets and keep the binary small.
+COMMONFLAGS = -O2 -Wall -Wno-unused-parameter -Wno-unused-variable $(DEFINES) $(INCFLAGS)
+CXXFLAGS    = $(COMMONFLAGS) -fno-exceptions -fno-rtti -std=gnu++17
+CFLAGS      = $(COMMONFLAGS) -std=gnu11
+
+# -lconio: Phase-1 on-screen boot-log console (conio over PVR). Remove once the
+# real PVR2 renderer + logging path lands.
+LIBS = -lconio -lm $(ADDON_LIBS)
+
+# libgcc/libstdc++-on-KOS static-init fixes (all wrappers in Main_DC.cpp). These
+# make the engine's C++ static initialisers survive on KallistiOS:
+#  * __register_frame_info/__deregister_frame_info -> no-op: frame_dummy registers
+#    the eh_frame table at static init by locking a libgcc mutex that misbehaves on
+#    SH4/KOS; we build -fno-exceptions so unwinding is never used.
+#  * mutex_lock -> force-acquire uncontended mutexes KOS spuriously rejects
+#    (EAGAIN) for libstdc++'s statically-initialised mutexes; safe because static
+#    init is single-threaded on the kernel thread. THIS is what makes it boot.
+#  * __cxa_guard_acquire/release/abort -> trivial single-threaded guards (no
+#    recursive mutex, no throw); equivalent to -fno-threadsafe-statics.
+#  * mutex_unlock -> pass-through with a [BAD-UNLOCK] safety-net log.
+# Without the mutex_lock/__cxa_guard fixes, a failed lock throws
+# __concurrence_lock_error which, with unwinding stripped, loops forever.
+LDFLAGS += -Wl,--wrap=__register_frame_info -Wl,--wrap=__deregister_frame_info
+LDFLAGS += -Wl,--wrap=mutex_unlock
+LDFLAGS += -Wl,--wrap=mutex_lock
+LDFLAGS += -Wl,--wrap=__cxa_guard_acquire
+LDFLAGS += -Wl,--wrap=__cxa_guard_release
+LDFLAGS += -Wl,--wrap=__cxa_guard_abort
+
+# ---- Rules ------------------------------------------------------------------
+.DEFAULT_GOAL := all
+all: stage
+
+$(TARGET).elf: $(OBJS)
+	kos-c++ -o $@ $(OBJS) $(LDFLAGS) $(ADDON_LIBDIR) $(LIBS)
+
+%.o: %.cpp
+	kos-c++ $(CXXFLAGS) -c $< -o $@
+
+%.o: %.c
+	kos-cc $(CFLAGS) -c $< -o $@
+
+# KOS kernel-stack override objects (see KOS_OVERRIDE_OBJS above). Explicit rules
+# with full source paths so VPATH can't substitute the stale in-tree KOS .o.
+kosovr_thread.o: $(KOS_BASE)/kernel/thread/thread.c
+	kos-cc $(CFLAGS) -DTHD_KERNEL_STACK_SIZE=$(KERNEL_STACK) -c $< -o $@
+kosovr_mm.o: $(KOS_BASE)/kernel/mm/mm.c
+	kos-cc $(CFLAGS) -DTHD_KERNEL_STACK_SIZE=$(KERNEL_STACK) -c $< -o $@
+kosovr_stack.o: $(KOS_BASE)/kernel/arch/dreamcast/kernel/stack.c
+	kos-cc $(CFLAGS) -DTHD_KERNEL_STACK_SIZE=$(KERNEL_STACK) -c $< -o $@
+
+# Stage the linked ELF where the addon's GetCompiledBinaryPath expects it
+# (<projectDir>/Build/Dreamcast/<name>.elf). mkdcdisc wraps it into .cdi/.gdi
+# in the addon's PostPackage.
+stage: $(TARGET).elf
+	@mkdir -p $(PROJECT_ROOT)/Build/Dreamcast
+	@cp $(TARGET).elf $(PROJECT_ROOT)/Build/Dreamcast/$(TARGET).elf
+	@echo "Staged $(PROJECT_ROOT)/Build/Dreamcast/$(TARGET).elf"
+
+clean:
+	@rm -f ./*.o ./*.elf
+
+cleanstage:
+	@rm -rf $(PROJECT_ROOT)/Build/Dreamcast
+
+.PHONY: all stage clean cleanstage

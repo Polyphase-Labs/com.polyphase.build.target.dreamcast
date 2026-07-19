@@ -1,0 +1,36 @@
+# Editor addon DLL build output
+build/
+Build/
+bin/
+obj/
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.obj
+*.sha256
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake-install.cmake
+*.cmake.stamp
+
+# Per-project console build artifacts (out-of-tree)
+Intermediate/
+Packaged/
+*.o
+*.d
+*.elf
+*.bin
+*.cdi
+*.gdi
+1ST_READ.BIN
+
+# Generated build script
+Runtime/**/polyphase_build.sh
+
+# Misc
+debug.log
+.vs/

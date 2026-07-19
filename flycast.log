@@ -1,0 +1,33 @@
+00:00:000 rend/dx11/dx11context.cpp:41 N[RENDERER]: DX11 Context initializing
+00:00:049 sdl/sdl.cpp:775 N[RENDERER]: Monitor refresh rate: 59 Hz (2560 x 1440)
+00:00:197 rend/dx11/dx11context.cpp:186 N[RENDERER]: No system-provided shader cache
+00:00:200 ui/gui.cpp:341 N[RENDERER]: Screen DPI is 96, size 640 x 480. Scaling by 1.00
+00:00:201 rend/dx11/dx11context.cpp:316 N[RENDERER]: Swapchain resized: 640 x 480
+00:00:201 rend/dx11/dx11_shaders.cpp:785 N[RENDERER]: Loaded 6 shaders from C:\Users\Justin Jaro\Documents\Flycast\flycast-win64-2.6\data\dx11_shader_cache.bin
+00:00:202 rend/dx11/dx11context.cpp:398 W[RENDERER]: Format B4G4R4A4 doesn't support mipmap autogen
+00:00:615 rend/dx11/dx11_renderer.cpp:45 N[RENDERER]: DX11 renderer initializing
+00:00:619 sdl/dreamlink.cpp:85 N[INPUT]: GUID: 030057564c050000e60c000000006800 VID:054c PID:0ce6
+00:00:619 sdl/sdl_gamepad.cpp:220 N[INPUT]: SDL: Opened joystick 0 on port 0: 'DualSense Wireless Controller' unique_id=sdl_joystick_0
+00:00:620 sdl/dreamlink.cpp:85 N[INPUT]: GUID: 0300b9695e0400008e02000000007200 VID:045e PID:028e
+00:00:620 sdl/sdl_gamepad.cpp:220 N[INPUT]: SDL: Opened joystick 1 on port 1: 'Xbox 360 Controller' unique_id=sdl_joystick_1
+00:00:620 hw/mem/addrspace.cpp:425 N[VMEM]: Info: nvmem is enabled
+00:00:628 hw/mem/addrspace.cpp:457 N[VMEM]: BASE 00007ff457e40000 RAM(16 MB) 00007ff463e40000 VRAM64(8 MB) 00007ff45be40000 ARAM(2 MB) 00007ff477e40000
+00:00:635 hw/mem/addrspace.cpp:425 N[VMEM]: Info: nvmem is enabled
+00:00:645 hw/mem/addrspace.cpp:457 N[VMEM]: BASE 00007ff457e40000 RAM(16 MB) 00007ff463e40000 VRAM64(8 MB) 00007ff45be40000 ARAM(2 MB) 00007ff477e40000
+00:00:653 emulator.cpp:63 N[BOOT]: Game ID is [T-00000]
+00:00:660 emulator.cpp:604 N[BOOT]: Did not load BIOS, using reios
+00:00:661 emulator.cpp:63 N[BOOT]: Game ID is [T-00000]
+00:00:661 sdl/sdl_gamepad.cpp:653 N[INPUT]: Resetting SDL gamepad to default: 0 1
+00:00:661 sdl/sdl_gamepad.cpp:653 N[INPUT]: Resetting SDL gamepad to default: 0 1
+00:00:701 reios/reios.cpp:638 N[REIOS]: -----------------
+00:00:701 reios/reios.cpp:639 N[REIOS]: REIOS: Booting up
+00:00:701 reios/reios.cpp:640 N[REIOS]: -----------------
+00:07:356 hw/pvr/ta_vtx.cpp:1678 W[PVR]: getRegionTileClipping overflow
+00:08:925 ui/gui.cpp:579 E[COMMON]: Flycast has stopped: Fatal: SH4 exception when blocked
+00:08:934 sdl/sdl_gamepad.cpp:653 N[INPUT]: Resetting SDL gamepad to default: 0 1
+00:08:935 sdl/sdl_gamepad.cpp:653 N[INPUT]: Resetting SDL gamepad to default: 0 1
+00:08:935 rend/dx11/dx11_renderer.cpp:175 N[RENDERER]: DX11 renderer terminating
+00:08:937 rend/dx11/dx11context.cpp:201 N[RENDERER]: DX11 Context terminating
+00:08:937 rend/dx11/dx11_shaders.cpp:759 N[RENDERER]: Saved 10 shaders to C:\Users\Justin Jaro\Documents\Flycast\flycast-win64-2.6\data\dx11_shader_cache.bin
+00:08:947 sdl/sdl_gamepad.cpp:502 N[INPUT]: SDL: Joystick 'DualSense Wireless Controller' on port 0 disconnected
+00:08:948 sdl/sdl_gamepad.cpp:502 N[INPUT]: SDL: Joystick 'Xbox 360 Controller' on port 1 disconnected
