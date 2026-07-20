@@ -1,7 +1,10 @@
 // MSVC's SDL deprecations on getenv/fopen/strncpy don't apply to this addon —
 // every call is bounds-checked and pointer-validated. Suppress before the CRT
-// headers come in.
+// headers come in. (The build systems also define this on the command line;
+// guard to avoid a redefinition warning when they do.)
+#ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
+#endif
 
 /**
  * @file ComPolyphaseBuildTargetDreamcast.cpp
@@ -48,6 +51,7 @@
 #include "Plugins/EditorUIHooks.h"
 #include "Plugins/PolyphaseBuildTargetAPI.h"
 #include "imgui.h"
+#include "DiscImage/DcDiscBuilder.h"
 #endif
 
 #include <cctype>
@@ -139,10 +143,14 @@ namespace
     constexpr const char* kRegionKey       = "dreamcast.region";       // "NTSC-U" | "NTSC-J" | "PAL"
     constexpr const char* kDiscFormatKey   = "dreamcast.discFormat";   // "cdi" | "gdi"
     constexpr const char* kMakefileKey     = "dreamcast.makefile";     // bare filename in addon root, or absolute override
+    constexpr const char* kPackagerKey     = "dreamcast.packager";     // "native" | "external"
 
     constexpr const char* kRegionDefault     = "NTSC-U";
     constexpr const char* kDiscFormatDefault = "cdi";
     constexpr const char* kMakefileDefault   = "Makefile_Dreamcast";
+    // "native" = the addon's built-in, GPL-free self-boot CDI writer (default;
+    // no external tools). "external" = the classic mkdcdisc / DreamSDK pipeline.
+    constexpr const char* kPackagerDefault   = "native";
     // KOS + sh-elf TUs are lighter than psp-gcc's, but the engine still has a
     // few 1 GB+ files; 4 is a safe laptop default. Workstations can bump it.
     constexpr const char* kJobsDefault       = "4";
@@ -512,6 +520,13 @@ namespace
         const std::string outSh  = ToShellPath(tc, std::string(ctx->packageOutputDir));
         const std::string intSh  = ToShellPath(tc, intHost);
         const std::string elfSh  = outSh + "/" + name + ".elf";
+        // Persistent selfboot folder (sibling of packageOutputDir): the disc-root
+        // staging (1ST_READ.BIN + cooked assets) copied out so an editor Build —
+        // not just the manual script — leaves a folder ready to master into a
+        // real-BIOS self-boot image with BootDreams.
+        const std::string selfbootSh =
+            ToShellPath(tc, (std::filesystem::path(ctx->packageOutputDir).parent_path()
+                             / "selfboot").string());
 
         std::ofstream out(scriptHost, std::ios::binary | std::ios::trunc);
         if (!out.is_open()) return "";
@@ -542,6 +557,11 @@ namespace
             << " -joliet -rock -l -o " << Sq(intSh + "/pp.iso") << " \"$STAGE\"\n";
         out << "cdi4dc " << Sq(intSh + "/pp.iso") << " "
             << Sq(outSh + "/" + name + ".cdi") << "\n";
+        // Also publish the disc-root staging as the persistent selfboot folder
+        // (for BootDreams real-BIOS mastering) before cleaning up.
+        out << "rm -rf " << Sq(selfbootSh) << "\n";
+        out << "mkdir -p " << Sq(selfbootSh) << "\n";
+        out << "cp -r \"$STAGE\"/. " << Sq(selfbootSh) << "/\n";
         out << "rm -rf \"$STAGE\" " << Sq(intSh + "/pp.bin") << " "
             << Sq(intSh + "/IP.BIN") << " " << Sq(intSh + "/pp.iso") << "\n";
         out.close();
@@ -562,6 +582,44 @@ namespace
         ForceDreamcastConfig(outDir + "/" + name + "/Config.ini");
         if (ctx->Log) ctx->Log(POLYPHASE_BT_LOG_DEBUG,
             "Dreamcast: patched WindowWidth/Height to 640/480 in packaged Config.ini");
+
+        // Native packager (default): build the self-boot CDI entirely in-process
+        // with the addon's built-in writer — no external tools, no DreamSDK/WSL,
+        // no GPL. Produces the MIL-CD Audio/Data layout that boots on real
+        // hardware. The "external" option falls back to the legacy pipelines
+        // below. Compilation still runs under the selected toolchain regardless.
+        if (ReadOption(ctx, kPackagerKey, kPackagerDefault) != "external")
+        {
+            dcdisc::DiscBuildParams p;
+            p.elfPath       = outDir + "/" + name + ".elf";
+            p.discRootDir   = outDir;
+            p.outputCdiPath = outDir + "/" + name + ".cdi";
+            p.gameName      = name;
+            p.region        = region;
+
+            auto logfn = [ctx](const std::string& m) {
+                if (ctx->WriteOutputLine) ctx->WriteOutputLine(m.c_str());
+            };
+            if (ctx->WriteOutputLine)
+                ctx->WriteOutputLine("Dreamcast: building self-boot CDI natively (no external tools)...");
+
+            std::string dcErr;
+            if (!dcdisc::BuildSelfBootCdi(p, &dcErr, logfn))
+            {
+                if (ctx->Log)
+                    ctx->Log(POLYPHASE_BT_LOG_ERROR, ("Dreamcast native CDI build failed: " + dcErr).c_str());
+                return 0;
+            }
+            if (ctx->Log)
+            {
+                char ok[512];
+                std::snprintf(ok, sizeof(ok),
+                    "Dreamcast package complete: %s/%s.cdi (native, region=%s)",
+                    outDir.c_str(), name.c_str(), region.c_str());
+                ctx->Log(POLYPHASE_BT_LOG_DEBUG, ok);
+            }
+            return 1;
+        }
 
         const Toolchain tc = ResolveToolchain(ctx);
         std::string cmd;
@@ -639,9 +697,10 @@ namespace
         if (ctx == nullptr || ctx->packageOutputDir == nullptr || ctx->projectName == nullptr) return 0;
 
         std::string fmt = ReadOption(ctx, kDiscFormatKey, kDiscFormatDefault);
-        // The DreamSDK route's classic pipeline always emits .cdi (cdi4dc),
-        // regardless of the profile's disc-format pick — match that here.
-        if (ResolveToolchain(ctx) == Toolchain::DreamSDK) fmt = "cdi";
+        // The native packager and the DreamSDK classic pipeline both always emit
+        // .cdi, regardless of the profile's disc-format pick — match that here.
+        if (ReadOption(ctx, kPackagerKey, kPackagerDefault) != "external") fmt = "cdi";
+        else if (ResolveToolchain(ctx) == Toolchain::DreamSDK) fmt = "cdi";
         // flycast is the most widely-available cross-platform DC emulator;
         // override with DC_EMULATOR for lxdream/redream/etc.
         const std::string emu = GetEnvOrEmpty("DC_EMULATOR");
@@ -716,6 +775,23 @@ namespace
                 "  KallistiOS WSL    - wsl bash, KallistiOS installed inside WSL.");
 
         const std::string curTc = kToolchains[tcIdx];
+
+        // ----- Disc packager -----------------------------------------------
+        static const char* kPackagers[]      = { "native", "external" };
+        static const char* kPackagerLabels[] = { "Native (built-in, no external tools)",
+                                                 "External (mkdcdisc / DreamSDK)" };
+        std::string pkgId = ReadOption(ctx, kPackagerKey, kPackagerDefault);
+        int pkgIdx = (pkgId == "external") ? 1 : 0;
+        if (ImGui::Combo("Disc Packager", &pkgIdx, kPackagerLabels, IM_ARRAYSIZE(kPackagerLabels)))
+            ctx->SetProfileSetting(kPackagerKey, kPackagers[pkgIdx]);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "How the .cdi disc image is built after compilation:\n"
+                "  Native   - the addon's built-in self-boot CDI writer. No external\n"
+                "             tools, no GPL. Produces a MIL-CD Audio/Data image that\n"
+                "             self-boots on real hardware (fixes the CD-player fallback).\n"
+                "  External - the classic mkdcdisc / DreamSDK cdi4dc pipeline (needs\n"
+                "             those tools on the build shell; also supports .gdi).");
 
         // ----- DreamSDK Home (dreamsdk route) ------------------------------
         if (curTc == "dreamsdk")
@@ -798,7 +874,7 @@ namespace
         }
 
         ImGui::Spacing();
-        ImGui::TextDisabled("Packaging uses mkdcdisc; emulator defaults to flycast (override DC_EMULATOR).");
+        ImGui::TextDisabled("Disc image built by the native writer by default (no external tools); emulator defaults to flycast (override DC_EMULATOR).");
         ImGui::TextDisabled("Set DC_HOST=<ip> to enable 'Run on Device' via dc-tool-ip.");
     }
 

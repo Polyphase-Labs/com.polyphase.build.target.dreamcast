@@ -38,6 +38,10 @@ set "SOURCES="
 for /r "Source" %%%%f in (*.cpp) do (
     set "SOURCES=!SOURCES! "%%%%f""
 )
+REM Vendored DiscImage C sources (cdi.c, disc_image.c, edc/*.c) must be compiled too.
+for /r "Source" %%%%f in (*.c) do (
+    set "SOURCES=!SOURCES! "%%%%f""
+)
 
 set "BUILD_FAILED=0"
 
@@ -53,7 +57,7 @@ pushd build\Windows\x64\Release
 cl /nologo /EHsc /O2 /MD /LD ^
     /I"..\..\..\..\Source" ^
     /Fe:"%ADDON_NAME%.dll" /Fo:"%ADDON_NAME%_" ^
-    /D "OCTAVE_PLUGIN_EXPORT" /D "NDEBUG" /D "PLATFORM_WINDOWS=1" ^
+    /D "OCTAVE_PLUGIN_EXPORT" /D "NDEBUG" /D "PLATFORM_WINDOWS=1" /D "_CRT_SECURE_NO_WARNINGS" ^
     !SOURCES! /link /DLL /MACHINE:X64
 if errorlevel 1 ( popd & echo Release build FAILED! & set "BUILD_FAILED=1" ) else ( popd & echo Release build succeeded )
 certutil -hashfile "build\Windows\x64\Release\%ADDON_NAME%.dll" SHA256 > "build\Windows\x64\Release\%ADDON_NAME%-Windows-x64-Release.sha256" 2>nul
@@ -67,7 +71,7 @@ pushd build\Windows\x64\Debug
 cl /nologo /EHsc /Od /MDd /LD /Zi ^
     /I"..\..\..\..\Source" ^
     /Fe:"%ADDON_NAME%.dll" /Fo:"%ADDON_NAME%_" /Fd:"%ADDON_NAME%.pdb" ^
-    /D "OCTAVE_PLUGIN_EXPORT" /D "_DEBUG" /D "PLATFORM_WINDOWS=1" ^
+    /D "OCTAVE_PLUGIN_EXPORT" /D "_DEBUG" /D "PLATFORM_WINDOWS=1" /D "_CRT_SECURE_NO_WARNINGS" ^
     !SOURCES! /link /DLL /MACHINE:X64 /DEBUG
 if errorlevel 1 ( popd & echo Debug build FAILED! & set "BUILD_FAILED=1" ) else ( popd & echo Debug build succeeded )
 certutil -hashfile "build\Windows\x64\Debug\%ADDON_NAME%.dll" SHA256 > "build\Windows\x64\Debug\%ADDON_NAME%-Windows-x64-Debug.sha256" 2>nul

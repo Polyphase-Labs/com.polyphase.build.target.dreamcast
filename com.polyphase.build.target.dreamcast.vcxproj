@@ -103,6 +103,28 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="Source\ComPolyphaseBuildTargetDreamcast.cpp" />
+    <ClCompile Include="Source\DiscImage\cdi.c" />
+    <ClCompile Include="Source\DiscImage\DcDiscBuilder.cpp" />
+    <ClInclude Include="Source\DiscImage\DcDiscBuilder.h" />
+    <ClCompile Include="Source\DiscImage\DcIpBin.cpp" />
+    <ClInclude Include="Source\DiscImage\DcIpBin.h" />
+    <ClCompile Include="Source\DiscImage\DcIso9660.cpp" />
+    <ClInclude Include="Source\DiscImage\DcIso9660.h" />
+    <ClCompile Include="Source\DiscImage\disc_image.c" />
+    <ClInclude Include="Source\DiscImage\disc_image.h" />
+    <ClInclude Include="Source\DiscImage\edc\ecc.h" />
+    <ClInclude Include="Source\DiscImage\edc\edc.h" />
+    <ClCompile Include="Source\DiscImage\edc\edc_ecc.c" />
+    <ClCompile Include="Source\DiscImage\edc\libedc.c" />
+    <ClInclude Include="Source\DiscImage\edc\libedc.h" />
+    <ClCompile Include="Source\DiscImage\edc\patch.c" />
+    <ClInclude Include="Source\DiscImage\edc\patch.h" />
+    <ClInclude Include="Source\DiscImage\elf.h" />
+    <ClCompile Include="Source\DiscImage\elf_parser.cpp" />
+    <ClInclude Include="Source\DiscImage\elf_parser.hpp" />
+    <ClInclude Include="Source\DiscImage\private.h" />
+    <ClCompile Include="Source\DiscImage\scramble.cpp" />
+    <ClInclude Include="Source\DiscImage\scramble.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

@@ -19,6 +19,7 @@
 #include "Engine/Renderer.h"
 #include "Engine/World.h"
 #include "Engine/Assets/Material.h"
+#include "Engine/Assets/MaterialLite.h"
 #include "Engine/Assets/StaticMesh.h"
 #include "Engine/Assets/SkeletalMesh.h"
 #include "Engine/Assets/Texture.h"
@@ -164,24 +165,37 @@ static inline uint32_t DcFloatsToArgb(glm::vec3 rgb, float a)
 static void DcSubmitMeshTriangles(const uint8_t* verts, uint32_t stride, bool hasColor,
                                   const IndexType* indices, uint32_t numIndices,
                                   const glm::mat4& mvp, const glm::mat3& normalMat,
-                                  glm::vec4 baseColor)
+                                  glm::vec4 baseColor, bool unlit,
+                                  pvr_ptr_t texVram, uint32_t texW, uint32_t texH, int texFmt,
+                                  float uvMaxX, float uvMaxY)
 {
     static const glm::vec3 kLightDir = glm::normalize(glm::vec3(0.35f, 0.75f, 0.55f));
-    const float kAmbient = 0.35f;
+    const float kAmbient = 0.55f;
 
     pvr_poly_cxt_t cxt;
     pvr_poly_hdr_t hdr;
-    pvr_poly_cxt_col(&cxt, PVR_LIST_OP_POLY);
+    if (texVram != nullptr)
+    {
+        // Textured: modulate the ARGB1555 texture by the shaded vertex colour.
+        pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, texFmt,
+                         (int)texW, (int)texH, texVram, PVR_FILTER_BILINEAR);
+    }
+    else
+    {
+        pvr_poly_cxt_col(&cxt, PVR_LIST_OP_POLY);
+    }
+    // Screen-space Y-flip inverts winding, so the default backface cull would drop
+    // front faces. Disable culling — the opaque depth test resolves occlusion.
+    cxt.gen.culling = PVR_CULLING_NONE;
     pvr_poly_compile(&hdr, &cxt);
     pvr_prim(&hdr, sizeof(hdr));
 
     pvr_vertex_t pv;
     pv.oargb = 0;
-    pv.u = pv.v = 0.0f;
 
     for (uint32_t t = 0; t + 3 <= numIndices; t += 3)
     {
-        float sx[3], sy[3], sz[3];
+        float sx[3], sy[3], sz[3], su[3], sv[3];
         uint32_t argb[3];
         bool skip = false;
 
@@ -196,10 +210,16 @@ static void DcSubmitMeshTriangles(const uint8_t* verts, uint32_t stride, bool ha
             sx[k] = (clip.x * invw * 0.5f + 0.5f) * kDcScreenW;
             sy[k] = (1.0f - (clip.y * invw * 0.5f + 0.5f)) * kDcScreenH;
             sz[k] = invw;
+            su[k] = vtx->mTexcoord0.x * uvMaxX;
+            sv[k] = vtx->mTexcoord0.y * uvMaxY;
 
-            const glm::vec3 n = glm::normalize(normalMat * vtx->mNormal);
-            const float lambert = glm::max(glm::dot(n, kLightDir), 0.0f);
-            const float shade = kAmbient + (1.0f - kAmbient) * lambert;
+            float shade = 1.0f;
+            if (!unlit)
+            {
+                const glm::vec3 n = glm::normalize(normalMat * vtx->mNormal);
+                const float lambert = glm::max(glm::dot(n, kLightDir), 0.0f);
+                shade = kAmbient + (1.0f - kAmbient) * lambert;
+            }
 
             glm::vec3 rgb(baseColor);
             float a = baseColor.a;
@@ -217,16 +237,22 @@ static void DcSubmitMeshTriangles(const uint8_t* verts, uint32_t stride, bool ha
         if (skip) continue;
 
         pv.flags = PVR_CMD_VERTEX;
-        pv.x = sx[0]; pv.y = sy[0]; pv.z = sz[0]; pv.argb = argb[0]; pvr_prim(&pv, sizeof(pv));
-        pv.x = sx[1]; pv.y = sy[1]; pv.z = sz[1]; pv.argb = argb[1]; pvr_prim(&pv, sizeof(pv));
+        pv.x = sx[0]; pv.y = sy[0]; pv.z = sz[0]; pv.u = su[0]; pv.v = sv[0]; pv.argb = argb[0]; pvr_prim(&pv, sizeof(pv));
+        pv.x = sx[1]; pv.y = sy[1]; pv.z = sz[1]; pv.u = su[1]; pv.v = sv[1]; pv.argb = argb[1]; pvr_prim(&pv, sizeof(pv));
         pv.flags = PVR_CMD_VERTEX_EOL;
-        pv.x = sx[2]; pv.y = sy[2]; pv.z = sz[2]; pv.argb = argb[2]; pvr_prim(&pv, sizeof(pv));
+        pv.x = sx[2]; pv.y = sy[2]; pv.z = sz[2]; pv.u = su[2]; pv.v = sv[2]; pv.argb = argb[2]; pvr_prim(&pv, sizeof(pv));
     }
 }
 
 void GFX_BeginFrame()
 {
     if (!sPvrInitialised) return;
+    // The engine's console init redirects KOS's dbgio device away from SCIF just
+    // before the render loop, killing serial output. Re-assert SCIF once on the
+    // first frame so in-loop logging (LogDebug/printf) keeps reaching flycast's
+    // Serial Console. (Debug aid; harmless in a shipping build.)
+    static bool sSerialReasserted = false;
+    if (!sSerialReasserted) { sSerialReasserted = true; dbgio_dev_select("scif"); }
     pvr_wait_ready();
     pvr_scene_begin();
     // Open the opaque list and keep it open for the whole frame; the engine's
@@ -289,8 +315,74 @@ float GFX_GetLightBakeProgress() { return 0.0f; }
 void GFX_EnableMaterials(bool /*enable*/) {}
 void GFX_BeginGpuTimestamp(const char* /*name*/) {}
 void GFX_EndGpuTimestamp(const char* /*name*/) {}
-void GFX_CreateTextureResource(Texture* texture, std::vector<uint8_t>& /*data*/) {}
-void GFX_DestroyTextureResource(Texture* texture) {}
+static uint32_t DcNextPow2(uint32_t v)
+{
+    uint32_t p = 8;                 // PVR minimum texture dimension
+    while (p < v) p <<= 1;
+    return p;
+}
+
+
+
+void GFX_CreateTextureResource(Texture* texture, std::vector<uint8_t>& data)
+{
+    if (!sPvrInitialised || texture == nullptr) return;
+    TextureResource* r = texture->GetResource();
+    if (r == nullptr) return;
+
+    const uint32_t srcW = texture->GetWidth();
+    const uint32_t srcH = texture->GetHeight();
+    const std::vector<uint8_t>& px = !texture->GetPixels().empty() ? texture->GetPixels() : data;
+    if (srcW == 0 || srcH == 0 || px.size() < (size_t)srcW * srcH * 4)
+        return;
+
+    // PVR needs power-of-two dimensions. Convert RGBA8888 -> ARGB1555 (5-bit
+    // colour + a 1-bit alpha for cutout, usable by the punch-through path later).
+    const uint32_t w = DcNextPow2(srcW);
+    const uint32_t h = DcNextPow2(srcH);
+    uint16_t* conv = (uint16_t*)malloc((size_t)w * h * 2);
+    if (conv == nullptr) return;
+    for (uint32_t y = 0; y < h; ++y)
+    {
+        const uint32_t sy = (y < srcH) ? y : srcH - 1;    // edge-replicate padding
+        for (uint32_t x = 0; x < w; ++x)
+        {
+            const uint32_t sx = (x < srcW) ? x : srcW - 1;
+            const uint8_t* p = &px[((size_t)sy * srcW + sx) * 4];
+            const uint16_t a = (p[3] >= 128) ? 0x8000 : 0;
+            conv[(size_t)y * w + x] = (uint16_t)(a | ((p[0] >> 3) << 10) | ((p[1] >> 3) << 5) | (p[2] >> 3));
+        }
+    }
+
+    if (r->mPixels != nullptr) pvr_mem_free((pvr_ptr_t)r->mPixels);
+    pvr_ptr_t vram = pvr_mem_malloc((size_t)w * h * 2);
+    if (vram != nullptr)
+    {
+        // pvr_txr_load_ex twiddles the linear source into the PVR's native
+        // Morton layout by default (PVR_TXRLOAD_FMT_NOTWIDDLE would skip it), so
+        // hand it the plain conv[] and mark the texture twiddled for the poly ctx.
+        pvr_txr_load_ex(conv, vram, w, h, PVR_TXRLOAD_16BPP);
+    }
+    free(conv);
+
+    r->mPixels   = vram;
+    r->mWidth    = w;
+    r->mHeight   = h;
+    r->mBufWidth = w;
+    r->mSwizzled = 1;   // twiddled (pvr_txr_load_ex twiddled it)
+    // Crop UVs to the real content within the padded POT texture.
+    texture->SetUVMax(glm::vec2((float)srcW / (float)w, (float)srcH / (float)h));
+}
+
+void GFX_DestroyTextureResource(Texture* texture)
+{
+    if (texture == nullptr) return;
+    TextureResource* r = texture->GetResource();
+    if (r == nullptr || r->mPixels == nullptr) return;
+    pvr_mem_free((pvr_ptr_t)r->mPixels);
+    r->mPixels = nullptr;
+    r->mWidth = r->mHeight = r->mBufWidth = 0;
+}
 void GFX_UpdateTextureResourcePixels(Texture* texture, const uint8_t* src,
                                      uint32_t srcWidth, uint32_t srcHeight) {}
 void GFX_CreateMaterialResource(Material* /*material*/) {}
@@ -358,9 +450,35 @@ void GFX_DrawStaticMeshComp(StaticMesh3D* comp, StaticMesh* meshOverride)
     const glm::mat4 mvp   = cam->GetViewProjectionMatrix() * model;
     const glm::mat3 nrm   = glm::mat3(model);   // TODO: inverse-transpose for non-uniform scale
 
+    // Resolve the material's first texture (if any) to its uploaded VRAM handle.
+    pvr_ptr_t texVram = nullptr;
+    uint32_t  texW = 0, texH = 0;
+    int       texFmt = PVR_TXRFMT_ARGB1555;
+    float     uvMaxX = 1.0f, uvMaxY = 1.0f;
+    MaterialLite* lite = Material::AsLite(comp->GetMaterial());
+    Texture* tex = lite ? lite->GetTexture(0) : nullptr;
+    if (tex != nullptr)
+    {
+        TextureResource* tr = tex->GetResource();
+        if (tr != nullptr && tr->mPixels != nullptr && tr->mWidth > 0)
+        {
+            texVram = (pvr_ptr_t)tr->mPixels;
+            texW = tr->mWidth;
+            texH = tr->mHeight;
+            texFmt = PVR_TXRFMT_ARGB1555 | (tr->mSwizzled ? 0 : PVR_TXRFMT_NONTWIDDLED);
+            uvMaxX = (float)tex->GetWidth()  / (float)tr->mWidth;
+            uvMaxY = (float)tex->GetHeight() / (float)tr->mHeight;
+        }
+    }
+    // Material colour tints the texture; Unlit materials (e.g. the skybox) skip
+    // the baked directional shade so they render full-bright.
+    const glm::vec4 base  = lite ? lite->GetColor() : glm::vec4(1.0f);
+    const bool      unlit = lite ? (lite->GetShadingModel() == ShadingModel::Unlit) : false;
+
     DcSubmitMeshTriangles(reinterpret_cast<const uint8_t*>(r->mVertexData), r->mVertexStride,
                           r->mVertexFlags != 0, reinterpret_cast<const IndexType*>(r->mIndexData),
-                          r->mNumIndices, mvp, nrm, glm::vec4(1.0f));
+                          r->mNumIndices, mvp, nrm, base, unlit,
+                          texVram, texW, texH, texFmt, uvMaxX, uvMaxY);
     sDrewRealMeshThisFrame = true;
 }
 void GFX_CreateSkeletalMeshCompResource(SkeletalMesh3D* /*c*/) {}

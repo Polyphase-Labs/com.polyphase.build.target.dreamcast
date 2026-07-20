@@ -319,8 +319,6 @@ ThreadObject* SYS_CreateThread(ThreadFuncFP func, void* arg)
     attr.label           = "polyphase_worker";
 
     kthread_t* th = thd_create_ex(&attr, func, arg);
-    printf("[SYS_CreateThread] func=%p stack=%uKB -> th=%p\n",
-           (void*)func, (unsigned)(attr.stack_size / 1024), (void*)th);
     if (th == nullptr)
     {
         LogError("SYS_CreateThread: thd_create_ex failed");
