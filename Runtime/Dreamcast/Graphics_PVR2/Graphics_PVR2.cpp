@@ -40,40 +40,49 @@
 #include <dc/pvr.h>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 // Dreamcast video is a fixed 640x480 framebuffer.
 static const int kDcScreenW = 640;
 static const int kDcScreenH = 480;
 static bool sPvrInitialised = false;
 
-// Frame/pass state. PVR needs exactly one list open across all the draws the
-// engine issues between BeginFrame and EndFrame, so the opaque list is opened in
-// BeginFrame and closed in EndFrame (not per-draw). We only submit geometry
-// during the Forward pass (Shadows/HitCheck/Selected passes re-issue the same
-// draws and would double-submit).
-static bool sOpaqueListOpen = false;
-static bool sInForwardPass  = false;
+// PVR requires all polys of one list type to be submitted together and in order:
+// opaque (OP) -> punch-through (PT, alpha-tested cutouts) -> translucent (TR,
+// alpha-blended). The engine issues draws in scene order, mixing blend modes, so
+// each GFX_Draw*Comp transforms its geometry and BUFFERS it into a per-list bin;
+// GFX_EndFrame then flushes OP -> PT -> TR in the required order. A single vertex
+// pool + lightweight batch descriptors are cleared per frame but keep capacity.
+enum DcList { DC_LIST_OP = 0, DC_LIST_PT, DC_LIST_TR, DC_LIST_COUNT };
+static const pvr_list_t kPvrList[DC_LIST_COUNT] = { PVR_LIST_OP_POLY, PVR_LIST_PT_POLY, PVR_LIST_TR_POLY };
 
-// Draw the engine's test cube while there is no real scene; suppressed once real
-// meshes are being submitted so it doesn't overlap them.
-static bool sDrewRealMeshThisFrame = false;
+struct DcBatch { pvr_poly_hdr_t hdr; uint32_t vertStart; uint32_t vertCount; uint8_t list; };
+static std::vector<pvr_vertex_t> sVertPool;
+static std::vector<DcBatch>      sBatches;
 
-// ---- Lifecycle (minimal PVR setup: boots to a cleared screen) -------------
+static bool sInForwardPass = false;
+static bool sSceneOpen      = false;
+
+// ---- Lifecycle ------------------------------------------------------------
 
 void GFX_Initialize()
 {
-    // Bring up the PowerVR2 tile accelerator. With no real draws yet (Phase 1),
-    // an empty scene each frame clears the screen to this background colour —
-    // visible proof the engine's render loop is running on the Dreamcast.
-    if (pvr_init_defaults() < 0)
+    // Bring up the PowerVR2 TA with all three poly bins we use enabled. (The
+    // *_defaults helper leaves punch-through disabled, which we need for Masked
+    // cutout materials.) OP, TR, PT = 16-word bins; a 512 KB vertex buffer.
+    pvr_init_params_t params = {
+        { PVR_BINSIZE_16, PVR_BINSIZE_0, PVR_BINSIZE_16, PVR_BINSIZE_0, PVR_BINSIZE_16 },
+        512 * 1024, 0, 0, 0, 0
+    };
+    if (pvr_init(&params) < 0)
     {
-        LogError("Graphics_PVR2: pvr_init_defaults() failed");
+        LogError("Graphics_PVR2: pvr_init() failed");
         sPvrInitialised = false;
         return;
     }
-    pvr_set_bg_color(0.10f, 0.15f, 0.35f);  // distinct blue so a boot is obvious
+    pvr_set_bg_color(0.10f, 0.15f, 0.35f);
     sPvrInitialised = true;
-    LogDebug("Graphics_PVR2: PVR initialised (640x480); Phase-1 clears to bg colour");
+    LogDebug("Graphics_PVR2: PVR initialised (640x480, OP+PT+TR bins)");
 }
 
 void GFX_Shutdown()
@@ -81,71 +90,6 @@ void GFX_Shutdown()
     if (!sPvrInitialised) return;
     pvr_shutdown();
     sPvrInitialised = false;
-}
-
-// Phase-2 bring-up test geometry — a spinning 3D cube. This exercises the exact
-// pipeline the engine's mesh draws will use: PVR2 has NO hardware T&L, so the
-// SH4 multiplies each vertex by model·view·projection, does the perspective
-// divide, and emits SCREEN-space pvr_vertex_t (x,y in pixels, z = 1/w for depth).
-// Removed once GFX_DrawStaticMeshComp submits real engine geometry.
-// (glm comes in via Engine/Maths.h; GFX_MakePerspectiveMatrix already uses it.)
-static void DcSubmitTestCube()
-{
-    static const glm::vec3 kCorners[8] = {
-        {-1,-1,-1}, { 1,-1,-1}, { 1, 1,-1}, {-1, 1,-1},
-        {-1,-1, 1}, { 1,-1, 1}, { 1, 1, 1}, {-1, 1, 1},
-    };
-    // 6 faces, corners in perimeter order; one flat colour each.
-    static const int kFaces[6][4] = {
-        {0,1,2,3}, {5,4,7,6}, {4,0,3,7}, {1,5,6,2}, {4,5,1,0}, {3,2,6,7},
-    };
-    static const uint32_t kFaceColors[6] = {
-        0xFFFF4040, 0xFF40FF40, 0xFF4040FF, 0xFFFFFF40, 0xFF40FFFF, 0xFFFF40FF,
-    };
-
-    static float sAngle = 0.0f;
-    sAngle += 0.03f;
-
-    const glm::mat4 proj  = glm::perspective(glm::radians(60.0f), 640.0f / 480.0f, 0.1f, 100.0f);
-    const glm::mat4 view  = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, -5.0f));
-    const glm::mat4 model = glm::rotate(glm::mat4(1.0f), sAngle, glm::normalize(glm::vec3(0.4f, 1.0f, 0.2f)));
-    const glm::mat4 mvp   = proj * view * model;
-
-    pvr_poly_cxt_t cxt;
-    pvr_poly_hdr_t hdr;
-    pvr_poly_cxt_col(&cxt, PVR_LIST_OP_POLY);
-    pvr_poly_compile(&hdr, &cxt);
-    pvr_prim(&hdr, sizeof(hdr));
-
-    for (int f = 0; f < 6; ++f)
-    {
-        float sx[4], sy[4], sz[4];
-        bool clipped = false;
-        for (int i = 0; i < 4; ++i)
-        {
-            const glm::vec4 clip = mvp * glm::vec4(kCorners[kFaces[f][i]], 1.0f);
-            if (clip.w <= 0.01f) { clipped = true; break; }   // behind the near plane
-            const float invw = 1.0f / clip.w;
-            sx[i] = (clip.x * invw * 0.5f + 0.5f) * kDcScreenW;
-            sy[i] = (1.0f - (clip.y * invw * 0.5f + 0.5f)) * kDcScreenH;
-            sz[i] = invw;                                     // PVR depth = 1/w
-        }
-        if (clipped) continue;
-
-        // Quad as a PVR triangle strip: perimeter order 0,1,2,3 -> strip 0,1,3,2.
-        static const int kStrip[4] = {0, 1, 3, 2};
-        pvr_vertex_t v;
-        v.oargb = 0;
-        v.u = v.v = 0.0f;
-        v.argb = kFaceColors[f];
-        for (int k = 0; k < 4; ++k)
-        {
-            const int idx = kStrip[k];
-            v.flags = (k == 3) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
-            v.x = sx[idx]; v.y = sy[idx]; v.z = sz[idx];
-            pvr_prim(&v, sizeof(v));
-        }
-    }
 }
 
 // Pack a shaded RGBA (0..1 floats) into PVR ARGB (0xAARRGGBB).
@@ -167,28 +111,30 @@ static void DcSubmitMeshTriangles(const uint8_t* verts, uint32_t stride, bool ha
                                   const glm::mat4& mvp, const glm::mat3& normalMat,
                                   glm::vec4 baseColor, bool unlit,
                                   pvr_ptr_t texVram, uint32_t texW, uint32_t texH, int texFmt,
-                                  float uvMaxX, float uvMaxY)
+                                  float uvMaxX, float uvMaxY,
+                                  DcList list, bool additive)
 {
     static const glm::vec3 kLightDir = glm::normalize(glm::vec3(0.35f, 0.75f, 0.55f));
     const float kAmbient = 0.55f;
 
+    const pvr_list_t pvrList = kPvrList[list];
     pvr_poly_cxt_t cxt;
     pvr_poly_hdr_t hdr;
     if (texVram != nullptr)
-    {
-        // Textured: modulate the ARGB1555 texture by the shaded vertex colour.
-        pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, texFmt,
-                         (int)texW, (int)texH, texVram, PVR_FILTER_BILINEAR);
-    }
+        pvr_poly_cxt_txr(&cxt, pvrList, texFmt, (int)texW, (int)texH, texVram, PVR_FILTER_BILINEAR);
     else
-    {
-        pvr_poly_cxt_col(&cxt, PVR_LIST_OP_POLY);
-    }
+        pvr_poly_cxt_col(&cxt, pvrList);
     // Screen-space Y-flip inverts winding, so the default backface cull would drop
-    // front faces. Disable culling — the opaque depth test resolves occlusion.
+    // front faces. Disable culling — depth (opaque) / sorting (TR) resolves it.
     cxt.gen.culling = PVR_CULLING_NONE;
+    if (additive) { cxt.blend.src = PVR_BLEND_SRCALPHA; cxt.blend.dst = PVR_BLEND_ONE; }
     pvr_poly_compile(&hdr, &cxt);
-    pvr_prim(&hdr, sizeof(hdr));
+
+    // Buffer the transformed triangles; GFX_EndFrame flushes per list in order.
+    DcBatch batch;
+    batch.hdr       = hdr;
+    batch.list      = (uint8_t)list;
+    batch.vertStart = (uint32_t)sVertPool.size();
 
     pvr_vertex_t pv;
     pv.oargb = 0;
@@ -237,45 +183,56 @@ static void DcSubmitMeshTriangles(const uint8_t* verts, uint32_t stride, bool ha
         if (skip) continue;
 
         pv.flags = PVR_CMD_VERTEX;
-        pv.x = sx[0]; pv.y = sy[0]; pv.z = sz[0]; pv.u = su[0]; pv.v = sv[0]; pv.argb = argb[0]; pvr_prim(&pv, sizeof(pv));
-        pv.x = sx[1]; pv.y = sy[1]; pv.z = sz[1]; pv.u = su[1]; pv.v = sv[1]; pv.argb = argb[1]; pvr_prim(&pv, sizeof(pv));
+        pv.x = sx[0]; pv.y = sy[0]; pv.z = sz[0]; pv.u = su[0]; pv.v = sv[0]; pv.argb = argb[0]; sVertPool.push_back(pv);
+        pv.x = sx[1]; pv.y = sy[1]; pv.z = sz[1]; pv.u = su[1]; pv.v = sv[1]; pv.argb = argb[1]; sVertPool.push_back(pv);
         pv.flags = PVR_CMD_VERTEX_EOL;
-        pv.x = sx[2]; pv.y = sy[2]; pv.z = sz[2]; pv.u = su[2]; pv.v = sv[2]; pv.argb = argb[2]; pvr_prim(&pv, sizeof(pv));
+        pv.x = sx[2]; pv.y = sy[2]; pv.z = sz[2]; pv.u = su[2]; pv.v = sv[2]; pv.argb = argb[2]; sVertPool.push_back(pv);
     }
+
+    batch.vertCount = (uint32_t)sVertPool.size() - batch.vertStart;
+    if (batch.vertCount > 0) sBatches.push_back(batch);
 }
 
 void GFX_BeginFrame()
 {
     if (!sPvrInitialised) return;
     // The engine's console init redirects KOS's dbgio device away from SCIF just
-    // before the render loop, killing serial output. Re-assert SCIF once on the
-    // first frame so in-loop logging (LogDebug/printf) keeps reaching flycast's
-    // Serial Console. (Debug aid; harmless in a shipping build.)
+    // before the render loop, killing serial output. Re-assert SCIF once so in-loop
+    // logging keeps reaching flycast's Serial Console. (Debug aid.)
     static bool sSerialReasserted = false;
     if (!sSerialReasserted) { sSerialReasserted = true; dbgio_dev_select("scif"); }
     pvr_wait_ready();
     pvr_scene_begin();
-    // Open the opaque list and keep it open for the whole frame; the engine's
-    // per-node GFX_Draw*Comp calls (during the Forward pass) submit into it. The
-    // list clears the tile background to pvr_set_bg_color.
-    pvr_list_begin(PVR_LIST_OP_POLY);
-    sOpaqueListOpen = true;
-    sDrewRealMeshThisFrame = false;
+    sVertPool.clear();       // keeps capacity — no per-frame allocation churn
+    sBatches.clear();
+    sSceneOpen = true;
 }
 
 void GFX_EndFrame()
 {
-    if (!sPvrInitialised) return;
-    if (sOpaqueListOpen)
+    if (!sPvrInitialised || !sSceneOpen) return;
+
+    // Flush the buffered geometry per list, in the PVR's required order
+    // (opaque -> punch-through -> translucent). OP is always emitted so the tile
+    // background clears even on an empty frame; PT/TR only if they have batches.
+    for (int L = 0; L < DC_LIST_COUNT; ++L)
     {
-        // Fallback demo geometry only when the scene submitted nothing (e.g. no
-        // scene/camera yet), so there is always something on screen.
-        if (!sDrewRealMeshThisFrame)
-            DcSubmitTestCube();
+        bool has = false;
+        for (const DcBatch& b : sBatches) { if (b.list == L) { has = true; break; } }
+        if (L != DC_LIST_OP && !has) continue;
+
+        pvr_list_begin(kPvrList[L]);
+        for (const DcBatch& b : sBatches)
+        {
+            if (b.list != L) continue;
+            pvr_prim(&b.hdr, sizeof(b.hdr));
+            pvr_prim(&sVertPool[b.vertStart], b.vertCount * sizeof(pvr_vertex_t));
+        }
         pvr_list_finish();
-        sOpaqueListOpen = false;
     }
+
     pvr_scene_finish();
+    sSceneOpen = false;
 }
 
 void GFX_SetViewport(int32_t /*x*/, int32_t /*y*/, int32_t /*w*/, int32_t /*h*/, bool)
@@ -424,38 +381,29 @@ void GFX_DestroyStaticMeshResource(StaticMesh* staticMesh)
     if (r->mIndexData)  { free(r->mIndexData);  r->mIndexData  = nullptr; }
     r->mNumVertices = r->mNumIndices = 0;
 }
-void GFX_CreateSkeletalMeshResource(SkeletalMesh* sm,
-                                    uint32_t /*numVerts*/,
-                                    VertexSkinned* /*verts*/,
-                                    uint32_t numIdx,
-                                    IndexType* idx) {}
-void GFX_DestroySkeletalMeshResource(SkeletalMesh* sm) {}
 void GFX_CreateStaticMeshCompResource(StaticMesh3D* /*c*/) {}
 void GFX_DestroyStaticMeshCompResource(StaticMesh3D* c) {}
 void GFX_UpdateStaticMeshCompResourceColors(StaticMesh3D* /*c*/) {}
-void GFX_DrawStaticMeshComp(StaticMesh3D* comp, StaticMesh* meshOverride)
+// Shared draw path for static and (CPU-skinned) skeletal meshes: resolve the
+// material's texture, colour, shading and blend mode, then buffer the transformed
+// geometry into the right list. `verts` is an engine Vertex/VertexColor array.
+static void DcDrawMesh(const uint8_t* verts, uint32_t stride, bool hasColor,
+                       const IndexType* indices, uint32_t numIndices,
+                       const glm::mat4& model, Material* material)
 {
-    if (!sPvrInitialised || !sOpaqueListOpen || !sInForwardPass || comp == nullptr) return;
-
-    StaticMesh* mesh = meshOverride ? meshOverride : comp->GetStaticMesh();
-    if (mesh == nullptr) return;
-    StaticMeshResource* r = mesh->GetResource();
-    if (r == nullptr || r->mVertexData == nullptr || r->mIndexData == nullptr || r->mNumIndices == 0) return;
-
+    if (verts == nullptr || indices == nullptr || numIndices == 0) return;
     World* world = Renderer::Get()->GetCurrentWorld();
     Camera3D* cam = world ? world->GetActiveCamera() : nullptr;
     if (cam == nullptr) return;
 
-    const glm::mat4 model = comp->GetRenderTransform();
-    const glm::mat4 mvp   = cam->GetViewProjectionMatrix() * model;
-    const glm::mat3 nrm   = glm::mat3(model);   // TODO: inverse-transpose for non-uniform scale
+    const glm::mat4 mvp = cam->GetViewProjectionMatrix() * model;
+    const glm::mat3 nrm = glm::mat3(model);   // TODO: inverse-transpose for non-uniform scale
 
-    // Resolve the material's first texture (if any) to its uploaded VRAM handle.
     pvr_ptr_t texVram = nullptr;
     uint32_t  texW = 0, texH = 0;
     int       texFmt = PVR_TXRFMT_ARGB1555;
     float     uvMaxX = 1.0f, uvMaxY = 1.0f;
-    MaterialLite* lite = Material::AsLite(comp->GetMaterial());
+    MaterialLite* lite = Material::AsLite(material);
     Texture* tex = lite ? lite->GetTexture(0) : nullptr;
     if (tex != nullptr)
     {
@@ -470,24 +418,130 @@ void GFX_DrawStaticMeshComp(StaticMesh3D* comp, StaticMesh* meshOverride)
             uvMaxY = (float)tex->GetHeight() / (float)tr->mHeight;
         }
     }
-    // Material colour tints the texture; Unlit materials (e.g. the skybox) skip
-    // the baked directional shade so they render full-bright.
-    const glm::vec4 base  = lite ? lite->GetColor() : glm::vec4(1.0f);
-    const bool      unlit = lite ? (lite->GetShadingModel() == ShadingModel::Unlit) : false;
+    glm::vec4  base  = lite ? lite->GetColor() : glm::vec4(1.0f);
+    const bool unlit = lite ? (lite->GetShadingModel() == ShadingModel::Unlit) : false;
 
-    DcSubmitMeshTriangles(reinterpret_cast<const uint8_t*>(r->mVertexData), r->mVertexStride,
-                          r->mVertexFlags != 0, reinterpret_cast<const IndexType*>(r->mIndexData),
-                          r->mNumIndices, mvp, nrm, base, unlit,
-                          texVram, texW, texH, texFmt, uvMaxX, uvMaxY);
-    sDrewRealMeshThisFrame = true;
+    // Route by blend mode: Opaque->OP, Masked (alpha-tested cutout)->PT,
+    // Translucent->TR (alpha blend), Additive->TR with an additive blend func.
+    DcList   list     = DC_LIST_OP;
+    bool     additive = false;
+    switch (lite ? lite->GetBlendMode() : BlendMode::Opaque)
+    {
+        case BlendMode::Masked:      list = DC_LIST_PT; break;
+        case BlendMode::Translucent: list = DC_LIST_TR; break;
+        case BlendMode::Additive:    list = DC_LIST_TR; additive = true; break;
+        default:                     list = DC_LIST_OP; break;
+    }
+    base.a = (list == DC_LIST_TR) ? base.a * (lite ? lite->GetOpacity() : 1.0f) : 1.0f;
+
+    DcSubmitMeshTriangles(verts, stride, hasColor, indices, numIndices, mvp, nrm, base, unlit,
+                          texVram, texW, texH, texFmt, uvMaxX, uvMaxY, list, additive);
 }
-void GFX_CreateSkeletalMeshCompResource(SkeletalMesh3D* /*c*/) {}
-void GFX_DestroySkeletalMeshCompResource(SkeletalMesh3D* c) {}
-void GFX_ReallocateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* c, uint32_t numVerts) {}
+
+void GFX_DrawStaticMeshComp(StaticMesh3D* comp, StaticMesh* meshOverride)
+{
+    if (!sPvrInitialised || !sInForwardPass || comp == nullptr) return;
+    StaticMesh* mesh = meshOverride ? meshOverride : comp->GetStaticMesh();
+    if (mesh == nullptr) return;
+    StaticMeshResource* r = mesh->GetResource();
+    if (r == nullptr || r->mVertexData == nullptr || r->mIndexData == nullptr || r->mNumIndices == 0) return;
+
+    DcDrawMesh(reinterpret_cast<const uint8_t*>(r->mVertexData), r->mVertexStride, r->mVertexFlags != 0,
+               reinterpret_cast<const IndexType*>(r->mIndexData), r->mNumIndices,
+               comp->GetRenderTransform(), comp->GetMaterial());
+}
+
+// ---- Skeletal meshes (CPU-skinned) ----------------------------------------
+// GFX_IsCpuSkinningRequired returns true, so the engine skins on the CPU and
+// hands us the posed vertices each frame via UpdateSkeletalMeshCompVertexBuffer.
+// The mesh resource holds only the (static) index data; the per-comp resource
+// holds the per-frame posed vertex buffer.
+
+void GFX_CreateSkeletalMeshResource(SkeletalMesh* sm, uint32_t /*numVertices*/,
+                                    VertexSkinned* /*vertices*/, uint32_t numIndices, IndexType* indices)
+{
+    if (sm == nullptr) return;
+    SkeletalMeshResource* r = sm->GetResource();
+    if (r == nullptr) return;
+    if (r->mIndexData) { free(r->mIndexData); r->mIndexData = nullptr; }
+    if (numIndices && indices)
+    {
+        r->mIndexData = malloc((size_t)numIndices * sizeof(IndexType));
+        if (r->mIndexData) memcpy(r->mIndexData, indices, (size_t)numIndices * sizeof(IndexType));
+    }
+    r->mNumIndices = numIndices;
+}
+
+void GFX_DestroySkeletalMeshResource(SkeletalMesh* sm)
+{
+    if (sm == nullptr) return;
+    SkeletalMeshResource* r = sm->GetResource();
+    if (r == nullptr) return;
+    if (r->mIndexData) { free(r->mIndexData); r->mIndexData = nullptr; }
+    r->mNumIndices = 0;
+}
+
+void GFX_CreateSkeletalMeshCompResource(SkeletalMesh3D* /*c*/) {}   // buffer alloc'd lazily
+
+void GFX_DestroySkeletalMeshCompResource(SkeletalMesh3D* c)
+{
+    if (c == nullptr) return;
+    SkeletalMeshCompResource* r = c->GetResource();
+    if (r == nullptr) return;
+    if (r->mVertexData) { free(r->mVertexData); r->mVertexData = nullptr; }
+    r->mVertexCapacity = r->mNumVertices = 0;
+}
+
+void GFX_ReallocateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* c, uint32_t numVerts)
+{
+    if (c == nullptr) return;
+    SkeletalMeshCompResource* r = c->GetResource();
+    if (r == nullptr) return;
+    const uint32_t bytes = numVerts * (uint32_t)sizeof(Vertex);
+    if (bytes > r->mVertexCapacity)
+    {
+        if (r->mVertexData) free(r->mVertexData);
+        r->mVertexData     = malloc(bytes);
+        r->mVertexCapacity = r->mVertexData ? bytes : 0;
+    }
+    r->mVertexStride = (uint32_t)sizeof(Vertex);
+}
+
 void GFX_UpdateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* c,
-                                            const std::vector<Vertex>& skinnedVertices) {}
-void GFX_DrawSkeletalMeshComp(SkeletalMesh3D* c) {}
-bool GFX_IsCpuSkinningRequired(SkeletalMesh3D* /*c*/) { return false; }
+                                            const std::vector<Vertex>& skinnedVertices)
+{
+    if (c == nullptr) return;
+    SkeletalMeshCompResource* r = c->GetResource();
+    if (r == nullptr) return;
+    const uint32_t bytes = (uint32_t)(skinnedVertices.size() * sizeof(Vertex));
+    if (bytes > r->mVertexCapacity)
+    {
+        if (r->mVertexData) free(r->mVertexData);
+        r->mVertexData     = malloc(bytes);
+        r->mVertexCapacity = r->mVertexData ? bytes : 0;
+    }
+    if (r->mVertexData && bytes) memcpy(r->mVertexData, skinnedVertices.data(), bytes);
+    r->mNumVertices  = (uint32_t)skinnedVertices.size();
+    r->mVertexStride = (uint32_t)sizeof(Vertex);
+}
+
+void GFX_DrawSkeletalMeshComp(SkeletalMesh3D* c)
+{
+    if (!sPvrInitialised || !sInForwardPass || c == nullptr) return;
+    SkeletalMesh* mesh = c->GetSkeletalMesh();
+    if (mesh == nullptr) return;
+    SkeletalMeshResource*     mr = mesh->GetResource();
+    SkeletalMeshCompResource* cr = c->GetResource();
+    if (mr == nullptr || cr == nullptr) return;
+    if (mr->mIndexData == nullptr || mr->mNumIndices == 0) return;
+    if (cr->mVertexData == nullptr || cr->mNumVertices == 0) return;
+
+    DcDrawMesh(reinterpret_cast<const uint8_t*>(cr->mVertexData), cr->mVertexStride, false,
+               reinterpret_cast<const IndexType*>(mr->mIndexData), mr->mNumIndices,
+               c->GetRenderTransform(), c->GetMaterial());
+}
+
+bool GFX_IsCpuSkinningRequired(SkeletalMesh3D* /*c*/) { return true; }
 void GFX_DrawShadowMeshComp(ShadowMesh3D* c) {}
 void GFX_DrawInstancedMeshComp(InstancedMesh3D* comp) {}
 void GFX_CreateTextMeshCompResource(TextMesh3D* /*c*/) {}
