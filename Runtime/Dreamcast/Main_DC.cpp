@@ -35,6 +35,8 @@
 #include "Engine/AssetManager.h"
 #include "Engine/Vertex.h"
 #include "Engine/Assets/StaticMesh.h"
+#include "Engine/Assets/MaterialLite.h"
+#include "Engine/Assets/Texture.h"
 #include "Engine/Nodes/3D/StaticMesh3d.h"
 #include "Engine/Nodes/3D/Camera3d.h"
 
@@ -145,6 +147,105 @@ static void DcSpawnDemoScene()
     LogDebug("[DC] Phase-2 demo scene spawned (cube + camera)");
 }
 
+// A unit cube with per-face UVs (0..1) and white vertex colour, for the blend
+// demo below.
+static StaticMesh* DcBuildUvCube()
+{
+    static const glm::vec3 P[8] = {
+        {-1,-1,-1}, { 1,-1,-1}, { 1, 1,-1}, {-1, 1,-1},
+        {-1,-1, 1}, { 1,-1, 1}, { 1, 1, 1}, {-1, 1, 1},
+    };
+    struct Face { glm::vec3 n; int i[4]; };
+    const Face F[6] = {
+        {{ 0, 0, 1}, {4, 5, 6, 7}}, {{ 0, 0,-1}, {1, 0, 3, 2}}, {{ 1, 0, 0}, {5, 1, 2, 6}},
+        {{-1, 0, 0}, {0, 4, 7, 3}}, {{ 0, 1, 0}, {7, 6, 2, 3}}, {{ 0,-1, 0}, {0, 1, 5, 4}},
+    };
+    static const glm::vec2 UV[4] = { {0,0}, {1,0}, {1,1}, {0,1} };
+    VertexColor verts[24];
+    IndexType   indices[36];
+    for (int f = 0; f < 6; ++f)
+    {
+        for (int k = 0; k < 4; ++k)
+        {
+            VertexColor& v = verts[f * 4 + k];
+            v.mPosition  = P[F[f].i[k]];
+            v.mTexcoord0 = UV[k];
+            v.mTexcoord1 = UV[k];
+            v.mNormal    = F[f].n;
+            v.mColor     = 0xFFFFFFFF;
+        }
+        const int b = f * 4, o = f * 6;
+        indices[o + 0] = b + 0; indices[o + 1] = b + 1; indices[o + 2] = b + 2;
+        indices[o + 3] = b + 0; indices[o + 4] = b + 2; indices[o + 5] = b + 3;
+    }
+    StaticMesh* mesh = NewTransientAsset<StaticMesh>();
+    mesh->CreateRawColor(24, verts, 36, indices);
+    return mesh;
+}
+
+// Spawn a translucent cube and a masked (alpha-cutout) cube so both PVR blend
+// paths are visible. Temporary demo — remove once scenes provide their own
+// translucent/masked content.
+static void DcSpawnBlendDemo()
+{
+    World* world = GetWorld(0);
+    if (world == nullptr) return;
+    StaticMesh* cube = DcBuildUvCube();
+
+    // Translucent: blue, 50% opacity — you can see through it (TR list, blended).
+    {
+        MaterialLite* mat = NewTransientAsset<MaterialLite>();
+        MaterialLiteParams mp = mat->GetLiteParams();
+        mp.mShadingModel = ShadingModel::Unlit;
+        mp.mBlendMode    = BlendMode::Translucent;
+        mp.mNumTextures  = 0;
+        mp.mColor        = glm::vec4(0.3f, 0.6f, 1.0f, 1.0f);
+        mp.mOpacity      = 0.5f;
+        mat->SetLiteParams(mp);
+        mat->Create();
+
+        StaticMesh3D* node = world->SpawnNode<StaticMesh3D>();
+        node->SetPosition(glm::vec3(-3.5f, 2.0f, 1.0f));
+        node->SetStaticMesh(cube);
+        node->SetMaterialOverride(mat);
+        node->SetRotation(glm::vec3(15.0f, 25.0f, 0.0f));
+    }
+
+    // Masked: a checkerboard alpha texture — transparent squares are cut out
+    // (PT list, alpha-tested), leaving hard-edged holes.
+    {
+        uint8_t px[16 * 16 * 4];
+        for (int y = 0; y < 16; ++y)
+            for (int x = 0; x < 16; ++x)
+            {
+                uint8_t* p = &px[(y * 16 + x) * 4];
+                const bool opaque = (((x / 4) + (y / 4)) & 1) == 0;
+                p[0] = 255; p[1] = 200; p[2] = 60; p[3] = opaque ? 255 : 0;
+            }
+        Texture* tex = NewTransientAsset<Texture>();
+        tex->Init(16, 16, px);
+        tex->Create();
+
+        MaterialLite* mat = NewTransientAsset<MaterialLite>();
+        MaterialLiteParams mp = mat->GetLiteParams();
+        mp.mShadingModel = ShadingModel::Unlit;
+        mp.mBlendMode    = BlendMode::Masked;
+        mp.mNumTextures  = 1;
+        mp.mTextures[0]  = tex;
+        mp.mColor        = glm::vec4(1.0f);
+        mat->SetLiteParams(mp);
+        mat->Create();
+
+        StaticMesh3D* node = world->SpawnNode<StaticMesh3D>();
+        node->SetPosition(glm::vec3(3.5f, 2.0f, 1.0f));
+        node->SetStaticMesh(cube);
+        node->SetMaterialOverride(mat);
+        node->SetRotation(glm::vec3(15.0f, -25.0f, 0.0f));
+    }
+
+    LogDebug("[DC] blend-mode demo spawned (translucent + masked cubes)");
+}
+
 void OctPostInitialize()
 {
     // ReadEngineConfig (inside GameMain) reloads Config.ini AFTER
@@ -160,6 +261,7 @@ void OctPostInitialize()
     LogDebug("[DC] OctPostInitialize: window %ux%u -> 640x480", beforeW, beforeH);
 
     DcSpawnDemoScene();
+    DcSpawnBlendDemo();   // translucent + masked demo cubes (temporary)
 }
 
 void OctPreUpdate()

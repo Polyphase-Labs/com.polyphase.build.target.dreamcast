@@ -60,8 +60,12 @@ struct DcBatch { pvr_poly_hdr_t hdr; uint32_t vertStart; uint32_t vertCount; uin
 static std::vector<pvr_vertex_t> sVertPool;
 static std::vector<DcBatch>      sBatches;
 
-static bool sInForwardPass = false;
-static bool sSceneOpen      = false;
+static bool  sInForwardPass = false;
+static bool  sInUiPass      = false;
+static bool  sSceneOpen     = false;
+// UI overlays go in the translucent list with a huge 1/w so the PVR's depth-sort
+// puts them on top of the 3D scene; each UI draw nudges it up for painter order.
+static float sUiDepth       = 0.0f;
 
 // ---- Lifecycle ------------------------------------------------------------
 
@@ -100,6 +104,21 @@ static inline uint32_t DcFloatsToArgb(glm::vec3 rgb, float a)
     const uint32_t B = (uint32_t)(glm::clamp(rgb.b, 0.0f, 1.0f) * 255.0f + 0.5f);
     const uint32_t A = (uint32_t)(glm::clamp(a,     0.0f, 1.0f) * 255.0f + 0.5f);
     return (A << 24) | (R << 16) | (G << 8) | B;
+}
+
+// Resolve a Texture asset to its uploaded PVR handle + format + UV crop.
+static void DcResolveTexture(Texture* tex, pvr_ptr_t& vram, uint32_t& w, uint32_t& h,
+                             int& fmt, float& uvX, float& uvY)
+{
+    vram = nullptr; w = h = 0; fmt = PVR_TXRFMT_ARGB1555; uvX = uvY = 1.0f;
+    if (tex == nullptr) return;
+    TextureResource* tr = tex->GetResource();
+    if (tr == nullptr || tr->mPixels == nullptr || tr->mWidth == 0) return;
+    vram = (pvr_ptr_t)tr->mPixels;
+    w = tr->mWidth; h = tr->mHeight;
+    fmt = PVR_TXRFMT_ARGB1555 | (tr->mSwizzled ? 0 : PVR_TXRFMT_NONTWIDDLED);
+    uvX = (float)tex->GetWidth()  / (float)tr->mWidth;
+    uvY = (float)tex->GetHeight() / (float)tr->mHeight;
 }
 
 // CPU transform + light + submit an indexed triangle list. PVR2 has no hardware
@@ -205,6 +224,7 @@ void GFX_BeginFrame()
     pvr_scene_begin();
     sVertPool.clear();       // keeps capacity — no per-frame allocation churn
     sBatches.clear();
+    sUiDepth   = 0.0f;
     sSceneOpen = true;
 }
 
@@ -250,8 +270,12 @@ void GFX_SetScissor(int32_t /*x*/, int32_t /*y*/, int32_t /*w*/, int32_t /*h*/, 
 void GFX_BeginScreen(uint32_t /*screenIndex*/) {}
 void GFX_BeginView(uint32_t /*viewIndex*/) {}
 bool GFX_ShouldCullLights() { return true; }
-void GFX_BeginRenderPass(RenderPassId pass) { sInForwardPass = (pass == RenderPassId::Forward); }
-void GFX_EndRenderPass() { sInForwardPass = false; }
+void GFX_BeginRenderPass(RenderPassId pass)
+{
+    sInForwardPass = (pass == RenderPassId::Forward);
+    sInUiPass      = (pass == RenderPassId::Ui);
+}
+void GFX_EndRenderPass() { sInForwardPass = false; sInUiPass = false; }
 void GFX_SetPipelineState(PipelineConfig config) {}
 glm::mat4 GFX_MakePerspectiveMatrix(float fovyDegrees, float aspectRatio, float zNear, float zFar) { return glm::perspective(glm::radians(fovyDegrees), aspectRatio, zNear, zFar); }
 glm::mat4 GFX_MakeOrthographicMatrix(float left, float right, float bottom, float top, float zNear, float zFar) { return glm::ortho(left, right, bottom, top, zNear, zFar); }
@@ -399,25 +423,9 @@ static void DcDrawMesh(const uint8_t* verts, uint32_t stride, bool hasColor,
     const glm::mat4 mvp = cam->GetViewProjectionMatrix() * model;
     const glm::mat3 nrm = glm::mat3(model);   // TODO: inverse-transpose for non-uniform scale
 
-    pvr_ptr_t texVram = nullptr;
-    uint32_t  texW = 0, texH = 0;
-    int       texFmt = PVR_TXRFMT_ARGB1555;
-    float     uvMaxX = 1.0f, uvMaxY = 1.0f;
+    pvr_ptr_t texVram; uint32_t texW, texH; int texFmt; float uvMaxX, uvMaxY;
     MaterialLite* lite = Material::AsLite(material);
-    Texture* tex = lite ? lite->GetTexture(0) : nullptr;
-    if (tex != nullptr)
-    {
-        TextureResource* tr = tex->GetResource();
-        if (tr != nullptr && tr->mPixels != nullptr && tr->mWidth > 0)
-        {
-            texVram = (pvr_ptr_t)tr->mPixels;
-            texW = tr->mWidth;
-            texH = tr->mHeight;
-            texFmt = PVR_TXRFMT_ARGB1555 | (tr->mSwizzled ? 0 : PVR_TXRFMT_NONTWIDDLED);
-            uvMaxX = (float)tex->GetWidth()  / (float)tr->mWidth;
-            uvMaxY = (float)tex->GetHeight() / (float)tr->mHeight;
-        }
-    }
+    DcResolveTexture(lite ? lite->GetTexture(0) : nullptr, texVram, texW, texH, texFmt, uvMaxX, uvMaxY);
     glm::vec4  base  = lite ? lite->GetColor() : glm::vec4(1.0f);
     const bool unlit = lite ? (lite->GetShadingModel() == ShadingModel::Unlit) : false;
 
@@ -564,22 +572,117 @@ void GFX_CreateParticleCompResource(Particle3D* /*c*/) {}
 void GFX_DestroyParticleCompResource(Particle3D* c) {}
 void GFX_UpdateParticleCompVertexBuffer(Particle3D* c, const std::vector<VertexParticle>& vertices) {}
 void GFX_DrawParticleComp(Particle3D* c) {}
-void GFX_CreateQuadResource(Quad* quad) {}
-void GFX_DestroyQuadResource(Quad* quad) {}
-void GFX_UpdateQuadResourceVertexData(Quad* quad) {}
-void GFX_DrawQuad(Quad* quad) {}
-void GFX_CreateQuadBorderResource(Quad* quad) {}
-void GFX_DestroyQuadBorderResource(Quad* quad) {}
-void GFX_UpdateQuadBorderResourceVertexData(Quad* quad) {}
-void GFX_DrawQuadBorder(Quad* quad) {}
-void GFX_CreateTextResource(Text* text) {}
-void GFX_DestroyTextResource(Text* text) {}
-void GFX_UpdateTextResourceVertexData(Text* text) {}
-void GFX_DrawText(Text* text) {}
+// ---- 2D UI (Quad / Text / Poly) -------------------------------------------
+// UI widgets provide screen-space VertexUI (pixel coords, uv, packed colour). We
+// submit them straight to the translucent list at a huge 1/w so they overlay the
+// 3D scene, ignoring the depth buffer. The widgets hold their verts directly
+// (GetVertices), so Create/Update/Destroy resource hooks are no-ops.
+enum DcUITopo { DC_UI_FAN, DC_UI_TRILIST };
+
+static void DcSubmitUI(const VertexUI* verts, uint32_t n, Texture* tex, glm::vec4 tint, DcUITopo topo,
+                       glm::vec2 posScale, glm::vec2 posOffset)
+{
+    if (verts == nullptr || n < 3 || tint.a <= 0.0f) return;
+
+    pvr_ptr_t texVram; uint32_t texW, texH; int texFmt; float uvX, uvY;
+    DcResolveTexture(tex, texVram, texW, texH, texFmt, uvX, uvY);
+
+    pvr_poly_cxt_t cxt;
+    pvr_poly_hdr_t hdr;
+    if (texVram != nullptr)
+        pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY, texFmt, (int)texW, (int)texH, texVram, PVR_FILTER_BILINEAR);
+    else
+        pvr_poly_cxt_col(&cxt, PVR_LIST_TR_POLY);
+    cxt.gen.culling      = PVR_CULLING_NONE;
+    cxt.depth.comparison = PVR_DEPTHCMP_ALWAYS;   // overlay: ignore scene depth
+    cxt.depth.write      = PVR_DEPTHWRITE_DISABLE;
+    pvr_poly_compile(&hdr, &cxt);
+
+    const float z = 60000.0f + sUiDepth;          // sorts above 3D; painter order
+    sUiDepth += 1.0f;
+
+    DcBatch batch;
+    batch.hdr       = hdr;
+    batch.list      = (uint8_t)DC_LIST_TR;
+    batch.vertStart = (uint32_t)sVertPool.size();
+
+    auto emit = [&](const VertexUI& s, bool eol)
+    {
+        pvr_vertex_t v;
+        v.flags = eol ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+        v.oargb = 0;
+        v.x = s.mPosition.x * posScale.x + posOffset.x;
+        v.y = s.mPosition.y * posScale.y + posOffset.y;
+        v.z = z;
+        v.u = s.mTexcoord.x * uvX; v.v = s.mTexcoord.y * uvY;
+        const uint32_t c = s.mColor;   // engine packs R in the low byte
+        glm::vec4 col(( c        & 0xFF) / 255.0f, ((c >> 8)  & 0xFF) / 255.0f,
+                      ((c >> 16) & 0xFF) / 255.0f, ((c >> 24) & 0xFF) / 255.0f);
+        col *= tint;
+        v.argb = DcFloatsToArgb(glm::vec3(col), col.a);
+        sVertPool.push_back(v);
+    };
+
+    if (topo == DC_UI_FAN)
+        for (uint32_t i = 1; i + 1 < n; ++i) { emit(verts[0], false); emit(verts[i], false); emit(verts[i + 1], true); }
+    else
+        for (uint32_t i = 0; i + 2 < n; i += 3) { emit(verts[i], false); emit(verts[i + 1], false); emit(verts[i + 2], true); }
+
+    batch.vertCount = (uint32_t)sVertPool.size() - batch.vertStart;
+    if (batch.vertCount) sBatches.push_back(batch);
+}
+
+void GFX_CreateQuadResource(Quad* /*quad*/) {}
+void GFX_DestroyQuadResource(Quad* /*quad*/) {}
+void GFX_UpdateQuadResourceVertexData(Quad* /*quad*/) {}
+void GFX_DrawQuad(Quad* quad)
+{
+    if (!sPvrInitialised || !sInUiPass || quad == nullptr) return;
+    DcSubmitUI(quad->GetVertices(), quad->GetNumVertices(), quad->GetTexture(), quad->GetColor(),
+               DC_UI_FAN, glm::vec2(1.0f), glm::vec2(0.0f));
+}
+
+void GFX_CreateQuadBorderResource(Quad* /*quad*/) {}
+void GFX_DestroyQuadBorderResource(Quad* /*quad*/) {}
+void GFX_UpdateQuadBorderResourceVertexData(Quad* /*quad*/) {}
+void GFX_DrawQuadBorder(Quad* quad)
+{
+    if (!sPvrInitialised || !sInUiPass || quad == nullptr) return;
+    DcSubmitUI(quad->GetBorderVertices(), quad->GetNumVertices(), nullptr, quad->GetColor(),
+               DC_UI_FAN, glm::vec2(1.0f), glm::vec2(0.0f));
+}
+
+void GFX_CreateTextResource(Text* /*text*/) {}
+void GFX_DestroyTextResource(Text* /*text*/) {}
+void GFX_UpdateTextResourceVertexData(Text* /*text*/) {}
+void GFX_DrawText(Text* text)
+{
+    if (!sPvrInitialised || !sInUiPass || text == nullptr) return;
+    Font* font = text->GetFont();
+    Texture* atlas = font ? font->GetTexture() : nullptr;
+    const uint32_t n = text->GetNumVisibleCharacters() * TEXT_VERTS_PER_CHAR;
+
+    // Text glyph verts are widget-LOCAL at the font's native point size; bake in
+    // the anchor rect + justification offset and the scaledTextSize/fontSize
+    // scale (the desktop backends do this via a shader/TEV uniform).
+    const int32_t fontSize = font ? font->GetSize() : 32;
+    const float   scale    = (fontSize > 0) ? (text->GetScaledTextSize() / (float)fontSize) : 1.0f;
+    const Rect    rect     = text->GetRect();
+    const glm::vec2 just   = text->GetJustifiedOffset();
+
+    DcSubmitUI(text->GetVertices(), n, atlas, text->GetColor(), DC_UI_TRILIST,
+               glm::vec2(scale, scale), glm::vec2(rect.mX + just.x, rect.mY + just.y));
+}
+
 void GFX_CreatePolyResource(Poly* /*poly*/) {}
-void GFX_DestroyPolyResource(Poly* poly) {}
-void GFX_UpdatePolyResourceVertexData(Poly* poly) {}
-void GFX_DrawPoly(Poly* poly) {}
+void GFX_DestroyPolyResource(Poly* /*poly*/) {}
+void GFX_UpdatePolyResourceVertexData(Poly* /*poly*/) {}
+void GFX_DrawPoly(Poly* poly)
+{
+    if (!sPvrInitialised || !sInUiPass || poly == nullptr) return;
+    DcSubmitUI(poly->GetVertices(), poly->GetNumVertices(), poly->GetTexture(), poly->GetColor(),
+               DC_UI_FAN, glm::vec2(1.0f), glm::vec2(0.0f));
+}
 void GFX_DrawStaticMesh(StaticMesh* /*mesh*/, Material* /*material*/, const glm::mat4& /*transform*/, glm::vec4 /*color*/) {}
 void GFX_RenderPostProcessPasses() {}
 
