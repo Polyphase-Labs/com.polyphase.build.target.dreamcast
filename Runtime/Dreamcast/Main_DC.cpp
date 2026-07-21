@@ -147,6 +147,7 @@ static void DcSpawnDemoScene()
     LogDebug("[DC] Phase-2 demo scene spawned (cube + camera)");
 }
 
+#if 0   // Removed: translucent/masked blend-demo scaffolding (DcBuildUvCube + DcSpawnBlendDemo).
 // A unit cube with per-face UVs (0..1) and white vertex colour, for the blend
 // demo below.
 static StaticMesh* DcBuildUvCube()
@@ -245,6 +246,7 @@ static void DcSpawnBlendDemo()
 
     LogDebug("[DC] blend-mode demo spawned (translucent + masked cubes)");
 }
+#endif   // Removed blend-demo scaffolding
 
 void OctPostInitialize()
 {
@@ -261,7 +263,6 @@ void OctPostInitialize()
     LogDebug("[DC] OctPostInitialize: window %ux%u -> 640x480", beforeW, beforeH);
 
     DcSpawnDemoScene();
-    DcSpawnBlendDemo();   // translucent + masked demo cubes (temporary)
 }
 
 void OctPreUpdate()

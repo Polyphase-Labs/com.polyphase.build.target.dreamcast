@@ -25,6 +25,28 @@ bool HasExt(const std::string& name, const char* ext) {
     return n.size() >= e.size() && n.compare(n.size() - e.size(), e.size(), e) == 0;
 }
 
+// Delete a stale build artifact. Clears the read-only attribute first (Windows
+// refuses to delete or truncate read-only files) and reports a precise,
+// actionable error otherwise — the usual cause is an emulator still holding the
+// previous .cdi open.
+bool ForceRemove(const fs::path& p, std::string* err) {
+    std::error_code ec;
+    if (!fs::exists(p, ec)) return true;
+
+    fs::permissions(p, fs::perms::owner_write, fs::perm_options::add, ec);
+    ec.clear();
+    fs::remove(p, ec);
+    if (!fs::exists(p)) return true;
+
+    if (err) {
+        *err = "cannot delete stale file '" + p.string() + "'";
+        if (ec) *err += " (" + ec.message() + ")";
+        *err += " — it is probably still open in an emulator (flycast) or another "
+                "program. Close it and build again.";
+    }
+    return false;
+}
+
 // ELF -> flat binary -> scrambled 1ST_READ.BIN bytes.
 bool MakeBootBinary(const std::string& elfPath, std::vector<uint8_t>& out, std::string* err) {
     auto parser = elfparser::Parser::Load(fs::path(elfPath));
@@ -45,6 +67,22 @@ bool MakeBootBinary(const std::string& elfPath, std::vector<uint8_t>& out, std::
 bool BuildSelfBootCdi(const DiscBuildParams& params, std::string* err, const LogFn& log) {
     const fs::path discRoot(params.discRootDir);
     const std::string elfLeaf = fs::path(params.elfPath).filename().string();
+    const fs::path cdiPath(params.outputCdiPath);
+    const fs::path bootPath = discRoot / "1ST_READ.BIN";
+
+    // 0) Delete artifacts left by a previous build BEFORE doing any work. Two
+    //    reasons: a leftover that is read-only or locked would otherwise fail
+    //    deep in the build with a confusing error, and clearing the .cdi up
+    //    front means a later failure can't leave a stale image behind that
+    //    looks like a fresh one.
+    {
+        fs::path isoPath = cdiPath; isoPath.replace_extension(".iso");
+        fs::path gdiPath = cdiPath; gdiPath.replace_extension(".gdi");
+        const fs::path stale[] = { bootPath, discRoot / "IP.BIN", cdiPath, isoPath, gdiPath };
+        for (const fs::path& p : stale)
+            if (!ForceRemove(p, err)) return false;
+        Log(log, "Dreamcast: cleared previous build artifacts");
+    }
 
     // 1) ELF -> scrambled 1ST_READ.BIN, written into the disc root.
     std::vector<uint8_t> bootBin;
@@ -52,11 +90,12 @@ bool BuildSelfBootCdi(const DiscBuildParams& params, std::string* err, const Log
     Log(log, "Dreamcast: converted ELF -> scrambled 1ST_READ.BIN (" +
              std::to_string(bootBin.size()) + " bytes)");
 
-    const fs::path bootPath = discRoot / "1ST_READ.BIN";
     {
         std::ofstream f(bootPath, std::ios::binary | std::ios::trunc);
         if (!f) { if (err) *err = "cannot write " + bootPath.string(); return false; }
         f.write(reinterpret_cast<const char*>(bootBin.data()), std::streamsize(bootBin.size()));
+        f.close();
+        if (!f) { if (err) *err = "failed writing " + bootPath.string() + " (disk full or read-only?)"; return false; }
     }
 
     // 2) IP.BIN bootstrap.
@@ -112,7 +151,9 @@ bool BuildSelfBootCdi(const DiscBuildParams& params, std::string* err, const Log
     fs::create_directories(fs::path(params.outputCdiPath).parent_path(), ec);
     FILE* out = std::fopen(params.outputCdiPath.c_str(), "wb");
     if (!out) {
-        if (err) *err = "cannot open output .cdi: " + params.outputCdiPath;
+        if (err) *err = "cannot open output .cdi for writing: " + params.outputCdiPath +
+                        " — it is probably still open in an emulator (flycast) or another "
+                        "program. Close it and build again.";
         cd_free_image(&img);
         return false;
     }
