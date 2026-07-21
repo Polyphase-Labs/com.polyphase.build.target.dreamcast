@@ -39,6 +39,8 @@
 
 #include <kos.h>
 #include <dc/pvr.h>
+#include <dc/matrix.h>
+#include <dc/vector.h>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
@@ -48,6 +50,25 @@
 static const int kDcScreenW = 640;
 static const int kDcScreenH = 480;
 static bool sPvrInitialised = false;
+
+// Viewport matrix mapping NDC [-1,1] -> screen pixels with the Y-flip, folded into
+// the MVP so the SH-4 matrix unit (mat_transform / FTRV) outputs screen coords +
+// 1/w directly. Column-major (glm convention): screen_x = ndc_x*W/2 + W/2,
+// screen_y = -ndc_y*H/2 + H/2. The perspective divide by clip-w is done by
+// mat_transform, and W_viewport == clip-w keeps it correct.
+static const glm::mat4 kViewportMat(
+    kDcScreenW * 0.5f, 0.0f,               0.0f, 0.0f,   // col 0
+    0.0f,             -kDcScreenH * 0.5f,  0.0f, 0.0f,   // col 1
+    0.0f,              0.0f,               1.0f, 0.0f,   // col 2
+    kDcScreenW * 0.5f, kDcScreenH * 0.5f,  0.0f, 1.0f);  // col 3 (translation)
+
+// Scratch reused across draws (single-threaded render pass). sXfPos holds the
+// hardware-transformed screen positions strided like the source verts; sVtxCache
+// holds each unique vertex assembled once (dedup — the old path re-transformed
+// shared verts per triangle); sVtxValid flags near/behind-plane rejects.
+static std::vector<uint8_t>      sXfPos;
+static std::vector<pvr_vertex_t> sVtxCache;
+static std::vector<uint8_t>      sVtxValid;
 
 // PVR requires all polys of one list type to be submitted together and in order:
 // opaque (OP) -> punch-through (PT, alpha-tested cutouts) -> translucent (TR,
@@ -137,12 +158,15 @@ static void DcResolveTexture(Texture* tex, pvr_ptr_t& vram, uint32_t& w, uint32_
     uvY = (float)tex->GetHeight() / (float)tr->mHeight;
 }
 
-// CPU transform + light + submit an indexed triangle list. PVR2 has no hardware
-// T&L, so each vertex is multiplied by MVP here, perspective-divided to screen
-// space, and shaded with a single baked directional diffuse term (there is no
-// hardware lighting either). `verts` is the engine Vertex/VertexColor array.
+// Transform + light + submit an indexed triangle list. PVR2 has no hardware T&L,
+// so positions are transformed here — but on the SH-4's hardware matrix unit
+// (mat_transform / FTRV, ~single-instruction 4x4*vec + perspective divide) rather
+// than scalar glm. Each UNIQUE vertex is transformed and shaded once (the old path
+// redid the work per triangle, ~2-3x redundant for shared verts), cached, then the
+// index list just assembles triangles from the cache. `verts` is the engine
+// Vertex/VertexColor array; numVertices is its unique-vertex count.
 static void DcSubmitMeshTriangles(const uint8_t* verts, uint32_t stride, bool hasColor,
-                                  const IndexType* indices, uint32_t numIndices,
+                                  const IndexType* indices, uint32_t numIndices, uint32_t numVertices,
                                   const glm::mat4& mvp, const glm::mat4& model, const glm::mat3& normalMat,
                                   glm::vec3 camPos, uint8_t fogMode,
                                   glm::vec4 baseColor, bool unlit,
@@ -150,6 +174,8 @@ static void DcSubmitMeshTriangles(const uint8_t* verts, uint32_t stride, bool ha
                                   float uvMaxX, float uvMaxY,
                                   DcList list, bool additive)
 {
+    if (numVertices == 0 || numIndices < 3) return;
+
     const pvr_list_t pvrList = kPvrList[list];
     pvr_poly_cxt_t cxt;
     pvr_poly_hdr_t hdr;
@@ -169,97 +195,107 @@ static void DcSubmitMeshTriangles(const uint8_t* verts, uint32_t stride, bool ha
     if (fogMode != DC_FOG_OFF) { cxt.gen.specular = true; cxt.gen.color_clamp = true; }
     pvr_poly_compile(&hdr, &cxt);
 
-    // Buffer the transformed triangles; GFX_EndFrame flushes per list in order.
+    // --- Hardware transform of every unique vertex position, in one batch. -------
+    // screenMat = viewport * MVP; mat_transform outputs (x/w, y/w, 1/w) per vertex
+    // using FTRV + a hardware perspective divide.
+    const glm::mat4 screenMat = kViewportMat * mvp;
+    matrix_t km;
+    memcpy(km, &screenMat[0][0], sizeof(matrix_t));   // both glm & matrix_t are column-major
+    if (sXfPos.size() < (size_t)numVertices * stride) sXfPos.resize((size_t)numVertices * stride);
+    mat_load((const matrix_t*)&km);
+    mat_transform((const vector_t*)verts, (vector_t*)sXfPos.data(), (int)numVertices, (int)stride);
+
+    // --- Assemble each unique vertex once (screen pos from the batch above; UV,
+    //     colour, lighting and fog scalar). ----------------------------------------
+    if (sVtxCache.size()  < numVertices) sVtxCache.resize(numVertices);
+    if (sVtxValid.size()  < numVertices) sVtxValid.resize(numVertices);
+
+    for (uint32_t i = 0; i < numVertices; ++i)
+    {
+        const float* o = reinterpret_cast<const float*>(sXfPos.data() + (size_t)i * stride);
+        const float invw = o[2];
+        // Reject behind-camera (invw<=0) and past the near plane (w<0.01 -> invw>100).
+        if (!(invw > 0.0f && invw < 100.0f)) { sVtxValid[i] = 0; continue; }
+
+        const Vertex* vtx = reinterpret_cast<const Vertex*>(verts + (size_t)i * stride);
+        pvr_vertex_t& pv = sVtxCache[i];
+        pv.flags = PVR_CMD_VERTEX;
+        pv.x = o[0]; pv.y = o[1]; pv.z = invw;
+        pv.u = vtx->mTexcoord0.x * uvMaxX;
+        pv.v = vtx->mTexcoord0.y * uvMaxY;
+
+        glm::vec3 rgb(baseColor);
+        float a = baseColor.a;
+        if (hasColor)
+        {
+            const VertexColor* vc = reinterpret_cast<const VertexColor*>(verts + (size_t)i * stride);
+            const uint32_t c = vc->mColor;   // engine packs R in the low byte
+            rgb *= glm::vec3(( c        & 0xFF) / 255.0f,
+                             ((c >> 8)  & 0xFF) / 255.0f,
+                             ((c >> 16) & 0xFF) / 255.0f);
+            a *= ((c >> 24) & 0xFF) / 255.0f;
+        }
+
+        // Lighting: scene ambient + first directional light (Unlit skips it).
+        if (!unlit)
+        {
+            const glm::vec3 n = glm::normalize(normalMat * vtx->mNormal);
+            glm::vec3 lit = sAmbient;
+            if (sHasDirLight)
+                lit += glm::max(glm::dot(n, sLightDir), 0.0f) * sLightColor;
+            rgb *= lit;
+        }
+
+        // Fog — matches the engine's Fog.glsl (world-space euclidean distance from
+        // the camera, scaled by the fog colour's alpha; the sky uses a horizon-
+        // elevation fade). Split into modulate (argb) + offset (oargb).
+        float fogFactor = 0.0f;
+        if (fogMode != DC_FOG_OFF)
+        {
+            const glm::vec3 worldPos = glm::vec3(model * glm::vec4(vtx->mPosition, 1.0f));
+            const glm::vec3 toFrag   = worldPos - camPos;
+            if (fogMode == DC_FOG_SKY)
+            {
+                const glm::vec3 dir = glm::normalize(toFrag);
+                const float t = glm::clamp(dir.y / 0.25f, 0.0f, 1.0f);
+                fogFactor = (1.0f - glm::smoothstep(0.0f, 1.0f, t)) * sFog.mColor.a;
+            }
+            else
+            {
+                const float fragDepth = glm::length(toFrag);
+                const float fogLength = glm::max(sFog.mFar - sFog.mNear, 0.0001f);
+                float fogAlpha = glm::clamp((fragDepth - sFog.mNear) / fogLength, 0.0f, 1.0f) * sFog.mColor.a;
+                fogFactor = (sFog.mDensityFunc == FogDensityFunc::Exponential)
+                            ? (1.0f - glm::clamp(powf(20.0f, -fogAlpha), 0.0f, 1.0f))
+                            : fogAlpha;
+            }
+        }
+
+        pv.argb  = DcFloatsToArgb(rgb * (1.0f - fogFactor), a);
+        pv.oargb = (additive || fogFactor <= 0.0f)
+                   ? 0u : DcFloatsToArgb(glm::vec3(sFog.mColor) * fogFactor, 0.0f);
+        sVtxValid[i] = 1;
+    }
+
+    // --- Assemble triangles from the cache. -------------------------------------
     DcBatch batch;
     batch.hdr       = hdr;
     batch.list      = (uint8_t)list;
     batch.vertStart = (uint32_t)sVertPool.size();
 
-    pvr_vertex_t pv;
-    pv.oargb = 0;
-
     for (uint32_t t = 0; t + 3 <= numIndices; t += 3)
     {
-        float sx[3], sy[3], sz[3], su[3], sv[3];
-        uint32_t argb[3], oargb[3];
-        bool skip = false;
+        const uint32_t i0 = indices[t], i1 = indices[t + 1], i2 = indices[t + 2];
+        if (i0 >= numVertices || i1 >= numVertices || i2 >= numVertices) continue;
+        if (!sVtxValid[i0] || !sVtxValid[i1] || !sVtxValid[i2]) continue;
 
-        for (int k = 0; k < 3; ++k)
-        {
-            const IndexType vi = indices[t + k];
-            const Vertex* vtx = reinterpret_cast<const Vertex*>(verts + (size_t)vi * stride);
-
-            const glm::vec4 clip = mvp * glm::vec4(vtx->mPosition, 1.0f);
-            if (clip.w <= 0.01f) { skip = true; break; }   // behind near plane
-            const float invw = 1.0f / clip.w;
-            sx[k] = (clip.x * invw * 0.5f + 0.5f) * kDcScreenW;
-            sy[k] = (1.0f - (clip.y * invw * 0.5f + 0.5f)) * kDcScreenH;
-            sz[k] = invw;
-            su[k] = vtx->mTexcoord0.x * uvMaxX;
-            sv[k] = vtx->mTexcoord0.y * uvMaxY;
-
-            glm::vec3 rgb(baseColor);
-            float a = baseColor.a;
-            if (hasColor)
-            {
-                const VertexColor* vc = reinterpret_cast<const VertexColor*>(verts + (size_t)vi * stride);
-                const uint32_t c = vc->mColor;   // engine packs R in the low byte
-                rgb *= glm::vec3(( c        & 0xFF) / 255.0f,
-                                 ((c >> 8)  & 0xFF) / 255.0f,
-                                 ((c >> 16) & 0xFF) / 255.0f);
-                a *= ((c >> 24) & 0xFF) / 255.0f;
-            }
-
-            // Lighting: scene ambient + first directional light (Unlit skips it).
-            if (!unlit)
-            {
-                const glm::vec3 n = glm::normalize(normalMat * vtx->mNormal);
-                glm::vec3 lit = sAmbient;
-                if (sHasDirLight)
-                    lit += glm::max(glm::dot(n, sLightDir), 0.0f) * sLightColor;
-                rgb *= lit;
-            }
-
-            // Fog — matches the engine's Fog.glsl (world-space euclidean distance
-            // from the camera, scaled by the fog colour's alpha; the sky uses a
-            // horizon-elevation fade). Split into modulate (argb) + offset (oargb)
-            // so it blends toward the fog colour instead of multiplying the texture.
-            float fogFactor = 0.0f;
-            if (fogMode != DC_FOG_OFF)
-            {
-                const glm::vec3 worldPos = glm::vec3(model * glm::vec4(vtx->mPosition, 1.0f));
-                const glm::vec3 toFrag   = worldPos - camPos;
-                if (fogMode == DC_FOG_SKY)
-                {
-                    // Horizon fog: full at/below the horizon, clearing toward zenith.
-                    const glm::vec3 dir = glm::normalize(toFrag);
-                    const float t = glm::clamp(dir.y / 0.25f, 0.0f, 1.0f);
-                    fogFactor = (1.0f - glm::smoothstep(0.0f, 1.0f, t)) * sFog.mColor.a;
-                }
-                else
-                {
-                    const float fragDepth = glm::length(toFrag);
-                    const float fogLength = glm::max(sFog.mFar - sFog.mNear, 0.0001f);
-                    float fogAlpha = glm::clamp((fragDepth - sFog.mNear) / fogLength, 0.0f, 1.0f) * sFog.mColor.a;
-                    fogFactor = (sFog.mDensityFunc == FogDensityFunc::Exponential)
-                                ? (1.0f - glm::clamp(powf(20.0f, -fogAlpha), 0.0f, 1.0f))
-                                : fogAlpha;
-                }
-            }
-
-            // Additive polys fade toward black (no offset add) so distant glows
-            // dim instead of gaining the fog colour; everything else blends.
-            argb[k]  = DcFloatsToArgb(rgb * (1.0f - fogFactor), a);
-            oargb[k] = (additive || fogFactor <= 0.0f)
-                       ? 0u : DcFloatsToArgb(glm::vec3(sFog.mColor) * fogFactor, 0.0f);
-        }
-        if (skip) continue;
-
-        pv.flags = PVR_CMD_VERTEX;
-        pv.x = sx[0]; pv.y = sy[0]; pv.z = sz[0]; pv.u = su[0]; pv.v = sv[0]; pv.argb = argb[0]; pv.oargb = oargb[0]; sVertPool.push_back(pv);
-        pv.x = sx[1]; pv.y = sy[1]; pv.z = sz[1]; pv.u = su[1]; pv.v = sv[1]; pv.argb = argb[1]; pv.oargb = oargb[1]; sVertPool.push_back(pv);
-        pv.flags = PVR_CMD_VERTEX_EOL;
-        pv.x = sx[2]; pv.y = sy[2]; pv.z = sz[2]; pv.u = su[2]; pv.v = sv[2]; pv.argb = argb[2]; pv.oargb = oargb[2]; sVertPool.push_back(pv);
+        pvr_vertex_t v0 = sVtxCache[i0], v1 = sVtxCache[i1], v2 = sVtxCache[i2];
+        v0.flags = PVR_CMD_VERTEX;
+        v1.flags = PVR_CMD_VERTEX;
+        v2.flags = PVR_CMD_VERTEX_EOL;
+        sVertPool.push_back(v0);
+        sVertPool.push_back(v1);
+        sVertPool.push_back(v2);
     }
 
     batch.vertCount = (uint32_t)sVertPool.size() - batch.vertStart;
@@ -492,10 +528,10 @@ void GFX_UpdateStaticMeshCompResourceColors(StaticMesh3D* /*c*/) {}
 // material's texture, colour, shading and blend mode, then buffer the transformed
 // geometry into the right list. `verts` is an engine Vertex/VertexColor array.
 static void DcDrawMesh(const uint8_t* verts, uint32_t stride, bool hasColor,
-                       const IndexType* indices, uint32_t numIndices,
+                       const IndexType* indices, uint32_t numIndices, uint32_t numVertices,
                        const glm::mat4& model, Material* material, bool isSky = false)
 {
-    if (verts == nullptr || indices == nullptr || numIndices == 0) return;
+    if (verts == nullptr || indices == nullptr || numIndices == 0 || numVertices == 0) return;
     World* world = Renderer::Get()->GetCurrentWorld();
     Camera3D* cam = world ? world->GetActiveCamera() : nullptr;
     if (cam == nullptr) return;
@@ -533,7 +569,7 @@ static void DcDrawMesh(const uint8_t* verts, uint32_t stride, bool hasColor,
     if (sFog.mEnabled && (material == nullptr || material->ShouldApplyFog()))
         fogMode = isSky ? DC_FOG_SKY : DC_FOG_DISTANCE;
 
-    DcSubmitMeshTriangles(verts, stride, hasColor, indices, numIndices, mvp, model, nrm,
+    DcSubmitMeshTriangles(verts, stride, hasColor, indices, numIndices, numVertices, mvp, model, nrm,
                           camPos, fogMode, base, unlit,
                           texVram, texW, texH, texFmt, uvMaxX, uvMaxY, list, additive);
 }
@@ -550,7 +586,7 @@ void GFX_DrawStaticMeshComp(StaticMesh3D* comp, StaticMesh* meshOverride)
     // fog-far and would otherwise fully fog to the fog colour. Never fog it.
     const bool isSkybox = (comp->As<Skybox3D>() != nullptr);
     DcDrawMesh(reinterpret_cast<const uint8_t*>(r->mVertexData), r->mVertexStride, r->mVertexFlags != 0,
-               reinterpret_cast<const IndexType*>(r->mIndexData), r->mNumIndices,
+               reinterpret_cast<const IndexType*>(r->mIndexData), r->mNumIndices, r->mNumVertices,
                comp->GetRenderTransform(), comp->GetMaterial(), isSkybox);
 }
 
@@ -640,7 +676,7 @@ void GFX_DrawSkeletalMeshComp(SkeletalMesh3D* c)
     if (cr->mVertexData == nullptr || cr->mNumVertices == 0) return;
 
     DcDrawMesh(reinterpret_cast<const uint8_t*>(cr->mVertexData), cr->mVertexStride, false,
-               reinterpret_cast<const IndexType*>(mr->mIndexData), mr->mNumIndices,
+               reinterpret_cast<const IndexType*>(mr->mIndexData), mr->mNumIndices, cr->mNumVertices,
                c->GetRenderTransform(), c->GetMaterial());
 }
 
@@ -750,65 +786,66 @@ void GFX_DrawParticleComp(Particle3D* c)
     batch.vertStart = (uint32_t)sVertPool.size();
 
     const VertexParticle* vp = static_cast<const VertexParticle*>(r->mVertexData);
-    const uint32_t numParticles = r->mNumVertices / 4;
-    pvr_vertex_t pv;
-    pv.oargb = 0;
+    const uint32_t numVerts     = r->mNumVertices;      // 4 per particle
+    const uint32_t numParticles = numVerts / 4;
+    const uint32_t pstride      = (uint32_t)sizeof(VertexParticle);
 
-    // Quad corner layout (engine): 0=TL 1=BL 2=TR 3=BR -> tris (0,1,2)(2,1,3).
-    static const int kCorner[6] = { 0, 1, 2, 2, 1, 3 };
+    // Hardware-transform every (already-billboarded) particle vertex once.
+    const glm::mat4 screenMat = kViewportMat * mvp;
+    matrix_t km;
+    memcpy(km, &screenMat[0][0], sizeof(matrix_t));
+    if (sXfPos.size()    < (size_t)numVerts * pstride) sXfPos.resize((size_t)numVerts * pstride);
+    if (sVtxCache.size() < numVerts) sVtxCache.resize(numVerts);
+    if (sVtxValid.size() < numVerts) sVtxValid.resize(numVerts);
+    mat_load((const matrix_t*)&km);
+    mat_transform((const vector_t*)vp, (vector_t*)sXfPos.data(), (int)numVerts, (int)pstride);
 
+    for (uint32_t i = 0; i < numVerts; ++i)
+    {
+        const float* o = reinterpret_cast<const float*>(sXfPos.data() + (size_t)i * pstride);
+        const float invw = o[2];
+        if (!(invw > 0.0f && invw < 100.0f)) { sVtxValid[i] = 0; continue; }
+
+        const VertexParticle& s = vp[i];
+        pvr_vertex_t& pv = sVtxCache[i];
+        pv.flags = PVR_CMD_VERTEX;
+        pv.x = o[0]; pv.y = o[1]; pv.z = invw;
+        pv.u = s.mTexcoord.x * uvMaxX;
+        pv.v = s.mTexcoord.y * uvMaxY;
+
+        const uint32_t col = s.mColor;   // engine packs R in the low byte
+        glm::vec3 rgb((col & 0xFF) / 255.0f, ((col >> 8) & 0xFF) / 255.0f, ((col >> 16) & 0xFF) / 255.0f);
+        float a = ((col >> 24) & 0xFF) / 255.0f;
+
+        float fogFactor = 0.0f;
+        if (applyFog)
+        {
+            const glm::vec3 worldPos = glm::vec3(model * glm::vec4(s.mPosition, 1.0f));
+            const float fragDepth = glm::length(worldPos - camPos);
+            const float fogLength = glm::max(sFog.mFar - sFog.mNear, 0.0001f);
+            float fogAlpha = glm::clamp((fragDepth - sFog.mNear) / fogLength, 0.0f, 1.0f) * sFog.mColor.a;
+            fogFactor = (sFog.mDensityFunc == FogDensityFunc::Exponential)
+                        ? (1.0f - glm::clamp(powf(20.0f, -fogAlpha), 0.0f, 1.0f))
+                        : fogAlpha;
+        }
+        // Additive sprites fade toward black (no offset add); others blend.
+        pv.argb  = DcFloatsToArgb(rgb * (1.0f - fogFactor), a);
+        pv.oargb = (additive || fogFactor <= 0.0f)
+                   ? 0u : DcFloatsToArgb(glm::vec3(sFog.mColor) * fogFactor, 0.0f);
+        sVtxValid[i] = 1;
+    }
+
+    // Expand each quad (corners 0=TL 1=BL 2=TR 3=BR) into tris (0,1,2)(2,1,3).
     for (uint32_t p = 0; p < numParticles; ++p)
     {
-        const VertexParticle* q = &vp[p * 4];
-        float sx[6], sy[6], sz[6], su[6], sv[6]; uint32_t argb[6], oargb[6];
-        bool skip = false;
+        const uint32_t b = p * 4;
+        if (!sVtxValid[b] || !sVtxValid[b + 1] || !sVtxValid[b + 2] || !sVtxValid[b + 3]) continue;
 
-        for (int k = 0; k < 6; ++k)
-        {
-            const VertexParticle& s = q[kCorner[k]];
-            const glm::vec4 clip = mvp * glm::vec4(s.mPosition, 1.0f);
-            if (clip.w <= 0.01f) { skip = true; break; }
-            const float invw = 1.0f / clip.w;
-            sx[k] = (clip.x * invw * 0.5f + 0.5f) * kDcScreenW;
-            sy[k] = (1.0f - (clip.y * invw * 0.5f + 0.5f)) * kDcScreenH;
-            sz[k] = invw;
-            su[k] = s.mTexcoord.x * uvMaxX;
-            sv[k] = s.mTexcoord.y * uvMaxY;
-
-            const uint32_t col = s.mColor;   // engine packs R in the low byte
-            glm::vec3 rgb((col & 0xFF) / 255.0f, ((col >> 8) & 0xFF) / 255.0f, ((col >> 16) & 0xFF) / 255.0f);
-            float a = ((col >> 24) & 0xFF) / 255.0f;
-
-            // Radial distance fog (engine Fog.glsl), same split as meshes.
-            float fogFactor = 0.0f;
-            if (applyFog)
-            {
-                const glm::vec3 worldPos = glm::vec3(model * glm::vec4(s.mPosition, 1.0f));
-                const float fragDepth = glm::length(worldPos - camPos);
-                const float fogLength = glm::max(sFog.mFar - sFog.mNear, 0.0001f);
-                float fogAlpha = glm::clamp((fragDepth - sFog.mNear) / fogLength, 0.0f, 1.0f) * sFog.mColor.a;
-                fogFactor = (sFog.mDensityFunc == FogDensityFunc::Exponential)
-                            ? (1.0f - glm::clamp(powf(20.0f, -fogAlpha), 0.0f, 1.0f))
-                            : fogAlpha;
-            }
-            // Additive sprites fade toward black (no offset add); others blend.
-            argb[k]  = DcFloatsToArgb(rgb * (1.0f - fogFactor), a);
-            oargb[k] = (additive || fogFactor <= 0.0f)
-                       ? 0u : DcFloatsToArgb(glm::vec3(sFog.mColor) * fogFactor, 0.0f);
-        }
-        if (skip) continue;
-
-        pv.flags = PVR_CMD_VERTEX;
-        pv.x=sx[0]; pv.y=sy[0]; pv.z=sz[0]; pv.u=su[0]; pv.v=sv[0]; pv.argb=argb[0]; pv.oargb=oargb[0]; sVertPool.push_back(pv);
-        pv.x=sx[1]; pv.y=sy[1]; pv.z=sz[1]; pv.u=su[1]; pv.v=sv[1]; pv.argb=argb[1]; pv.oargb=oargb[1]; sVertPool.push_back(pv);
-        pv.flags = PVR_CMD_VERTEX_EOL;
-        pv.x=sx[2]; pv.y=sy[2]; pv.z=sz[2]; pv.u=su[2]; pv.v=sv[2]; pv.argb=argb[2]; pv.oargb=oargb[2]; sVertPool.push_back(pv);
-
-        pv.flags = PVR_CMD_VERTEX;
-        pv.x=sx[3]; pv.y=sy[3]; pv.z=sz[3]; pv.u=su[3]; pv.v=sv[3]; pv.argb=argb[3]; pv.oargb=oargb[3]; sVertPool.push_back(pv);
-        pv.x=sx[4]; pv.y=sy[4]; pv.z=sz[4]; pv.u=su[4]; pv.v=sv[4]; pv.argb=argb[4]; pv.oargb=oargb[4]; sVertPool.push_back(pv);
-        pv.flags = PVR_CMD_VERTEX_EOL;
-        pv.x=sx[5]; pv.y=sy[5]; pv.z=sz[5]; pv.u=su[5]; pv.v=sv[5]; pv.argb=argb[5]; pv.oargb=oargb[5]; sVertPool.push_back(pv);
+        pvr_vertex_t v0 = sVtxCache[b], v1 = sVtxCache[b + 1], v2 = sVtxCache[b + 2], v3 = sVtxCache[b + 3];
+        v0.flags = PVR_CMD_VERTEX; v1.flags = PVR_CMD_VERTEX; v2.flags = PVR_CMD_VERTEX_EOL;
+        sVertPool.push_back(v0); sVertPool.push_back(v1); sVertPool.push_back(v2);
+        v2.flags = PVR_CMD_VERTEX; v1.flags = PVR_CMD_VERTEX; v3.flags = PVR_CMD_VERTEX_EOL;
+        sVertPool.push_back(v2); sVertPool.push_back(v1); sVertPool.push_back(v3);
     }
 
     batch.vertCount = (uint32_t)sVertPool.size() - batch.vertStart;
