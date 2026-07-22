@@ -42,6 +42,7 @@
 #include <kos.h>
 #include <dc/sound/stream.h>
 #include <kos/sem.h>
+#include <kos/thread.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -105,7 +106,9 @@ namespace
 
     static semaphore_t   sLock = SEM_INITIALIZER(1);   // guards sVoices + sStreams
     static snd_stream_hnd_t sHnd = SND_STREAM_INVALID;
-    static bool          sInited     = false;
+    static bool          sInited      = false;
+    static kthread_t*    sPollThread  = nullptr;
+    static volatile bool sRun         = false;
 
     // Interleaved stereo output buffer handed back to snd_stream. 32-byte
     // aligned per the KOS callback contract; s32 accumulator keeps mixing
@@ -215,6 +218,21 @@ namespace
         return sOutBuffer;
     }
 
+    // Dedicated audio thread: keeps the SPU fed independently of the render loop.
+    // Polling + mixing + the G2 transfer to SPU RAM must NOT sit on the main
+    // thread — there they periodically stall the render frame (the streamed-BGM
+    // hitch). File I/O for the streaming pump stays on the main thread (engine's
+    // UpdateStreamingSources); this thread only drains the already-submitted ring.
+    void* PollThread(void* /*arg*/)
+    {
+        while (sRun)
+        {
+            snd_stream_poll(sHnd);
+            thd_sleep(10);   // buffer depth (~0.18 s) comfortably covers the interval
+        }
+        return nullptr;
+    }
+
     inline int32_t ClampVolQ15(float v)
     {
         const float scaled = v * kMasterAtten * 32768.0f;
@@ -245,13 +263,31 @@ void AUD_Initialize()
     snd_stream_volume(sHnd, 255);
     snd_stream_start(sHnd, kOutputRate, 1 /*stereo*/);
 
+    // Spawn the dedicated audio thread (offloads mixing off the render frame).
+    sRun = true;
+    kthread_attr_t attr = {};
+    attr.create_detached = false;
+    attr.stack_size      = 32 * 1024;
+    attr.prio            = PRIO_DEFAULT;
+    attr.label           = "polyphase_audio";
+    sPollThread = thd_create_ex(&attr, PollThread, nullptr);
+    if (sPollThread == nullptr)
+    {
+        LogError("Audio_DC: audio thread create failed — falling back to per-frame poll");
+        sRun = false;   // AUD_Update will poll instead
+    }
+
     sInited = true;
-    LogDebug("Audio_DC: snd_stream up, 44100Hz stereo, %d voices", AUDIO_MAX_VOICES);
+    LogDebug("Audio_DC: snd_stream up, 44100Hz stereo, %d voices%s", AUDIO_MAX_VOICES,
+             sPollThread ? " (threaded)" : "");
 }
 
 void AUD_Shutdown()
 {
     if (!sInited) return;
+
+    sRun = false;
+    if (sPollThread != nullptr) { thd_join(sPollThread, nullptr); sPollThread = nullptr; }
 
     if (sHnd != SND_STREAM_INVALID)
     {
@@ -271,14 +307,11 @@ void AUD_Shutdown()
     sInited = false;
 }
 
-// Poll the stream from the engine's per-frame audio tick, single-threaded — the
-// same context that polls maple (INP_Update) and drives the PVR, so there is no
-// concurrent G2-bus access to corrupt the AICA (a separate poll thread left the
-// AICA channels stalled). Frame-rate polling comfortably keeps the 0.18 s buffer
-// fed; snd_stream_poll only refills once it has drained past half.
+// The dedicated audio thread does the polling/mixing. Only poll here as a
+// fallback if that thread failed to spawn (keeps audio alive, just on the frame).
 void AUD_Update()
 {
-    if (!sInited) return;
+    if (!sInited || sRun) return;   // sRun == thread is handling it
     snd_stream_poll(sHnd);
 }
 
@@ -431,7 +464,12 @@ int32_t AUD_SubmitStreamBuffer(uint32_t streamId, const uint8_t* data, uint32_t 
     const uint64_t readAbsU64 = (uint64_t)s.readFrameAbs;
     const uint64_t inFlight   = s.writeFrameAbs - readAbsU64;
     const uint32_t freeFrames = (inFlight < s.ringFrames) ? (uint32_t)(s.ringFrames - inFlight) : 0u;
-    if (submitFrames > freeFrames) { sem_signal(&sLock); return 0; }
+    if (freeFrames == 0) { sem_signal(&sLock); return 0; }   // ring full — caller retries next frame
+    // PARTIAL accept: top up whatever space is free rather than rejecting the whole
+    // chunk when it doesn't fully fit. Rejecting-all only refilled the ring when it
+    // hit empty (sawtooth) → periodic underruns → stretched/slow playback. The pump
+    // stashes the remainder and resubmits it, so a partial accept keeps the ring full.
+    if (submitFrames > freeFrames) submitFrames = freeFrames;
 
     const int16_t* srcInt16 = reinterpret_cast<const int16_t*>(data);
     const uint32_t headIdx  = (uint32_t)(s.writeFrameAbs % s.ringFrames);
