@@ -96,12 +96,22 @@ static float sUiDepth       = 0.0f;
 
 // Scene lighting, cached once per Forward pass (like the PSP UploadLightData):
 // ambient is used AS-IS (colorScale would blow it past 1.0); the first
-// directional light is scaled by intensity * colorScale. Replaces the old
-// hardcoded lambert. Fog is set once per frame by GFX_SetFog.
+// directional light is scaled by intensity * colorScale. Point lights add a
+// distance-attenuated diffuse term per vertex. Replaces the old hardcoded
+// lambert. Fog is set once per frame by GFX_SetFog.
 static glm::vec3   sAmbient(0.35f);
 static glm::vec3   sLightDir(0.35f, 0.75f, 0.55f);   // toward the light
 static glm::vec3   sLightColor(1.0f);
 static bool        sHasDirLight = false;
+
+// Point lights baked into vertex colour. Capped — each one is per-vertex CPU work
+// (distance + normalize + dot) with no hardware lighting to fall back on. Spot
+// lights (no cone data reaches the backend) are treated as point lights.
+struct DcPointLight { glm::vec3 pos; glm::vec3 color; float radius; };
+static const int   kMaxDcPointLights = 4;
+static DcPointLight sPointLights[kMaxDcPointLights];
+static int         sNumPointLights = 0;
+
 static FogSettings sFog;
 
 // ---- Lifecycle ------------------------------------------------------------
@@ -153,7 +163,10 @@ static void DcResolveTexture(Texture* tex, pvr_ptr_t& vram, uint32_t& w, uint32_
     if (tr == nullptr || tr->mPixels == nullptr || tr->mWidth == 0) return;
     vram = (pvr_ptr_t)tr->mPixels;
     w = tr->mWidth; h = tr->mHeight;
-    fmt = PVR_TXRFMT_ARGB1555 | (tr->mSwizzled ? 0 : PVR_TXRFMT_NONTWIDDLED);
+    // mPsm holds a small format code set at upload: 1 = ARGB4444 (smooth alpha,
+    // for anti-aliased art / fonts), else ARGB1555 (1-bit alpha, 5-bit colour).
+    const int baseFmt = (tr->mPsm == 1) ? PVR_TXRFMT_ARGB4444 : PVR_TXRFMT_ARGB1555;
+    fmt = baseFmt | (tr->mSwizzled ? 0 : PVR_TXRFMT_NONTWIDDLED);
     uvX = (float)tex->GetWidth()  / (float)tr->mWidth;
     uvY = (float)tex->GetHeight() / (float)tr->mHeight;
 }
@@ -236,13 +249,31 @@ static void DcSubmitMeshTriangles(const uint8_t* verts, uint32_t stride, bool ha
             a *= ((c >> 24) & 0xFF) / 255.0f;
         }
 
-        // Lighting: scene ambient + first directional light (Unlit skips it).
+        // World-space position — needed by point lights and by fog. Computed once.
+        const bool needWorld = (!unlit && sNumPointLights > 0) || (fogMode != DC_FOG_OFF);
+        glm::vec3 worldPos(0.0f);
+        if (needWorld)
+            worldPos = glm::vec3(model * glm::vec4(vtx->mPosition, 1.0f));
+
+        // Lighting: scene ambient + first directional light + point lights (Unlit skips it).
         if (!unlit)
         {
             const glm::vec3 n = glm::normalize(normalMat * vtx->mNormal);
             glm::vec3 lit = sAmbient;
             if (sHasDirLight)
                 lit += glm::max(glm::dot(n, sLightDir), 0.0f) * sLightColor;
+            for (int li = 0; li < sNumPointLights; ++li)
+            {
+                const glm::vec3 toL  = sPointLights[li].pos - worldPos;
+                const float     dist = glm::length(toL);
+                const float     t    = glm::clamp(dist / sPointLights[li].radius, 0.0f, 1.0f);
+                const float     atten = (1.0f - t) * (1.0f - t);   // smooth falloff, 0 at radius
+                if (atten > 0.0f)
+                {
+                    const glm::vec3 L = toL / glm::max(dist, 0.0001f);
+                    lit += glm::max(glm::dot(n, L), 0.0f) * atten * sPointLights[li].color;
+                }
+            }
             rgb *= lit;
         }
 
@@ -252,7 +283,6 @@ static void DcSubmitMeshTriangles(const uint8_t* verts, uint32_t stride, bool ha
         float fogFactor = 0.0f;
         if (fogMode != DC_FOG_OFF)
         {
-            const glm::vec3 worldPos = glm::vec3(model * glm::vec4(vtx->mPosition, 1.0f));
             const glm::vec3 toFrag   = worldPos - camPos;
             if (fogMode == DC_FOG_SKY)
             {
@@ -375,18 +405,28 @@ void GFX_BeginRenderPass(RenderPassId pass)
         // Ambient is used AS-IS; colorScale would push it past 1.0 and wash out.
         sAmbient = world ? glm::vec3(world->GetAmbientLightColor()) : glm::vec3(0.0f);
 
-        sHasDirLight = false;
-        sLightColor  = glm::vec3(0.0f);
+        sHasDirLight    = false;
+        sLightColor     = glm::vec3(0.0f);
+        sNumPointLights = 0;
         if (rend)
         {
             const float colorScale = rend->GetColorScale();
             for (const LightData& ld : rend->GetLightData())
             {
-                if (ld.mType != LightType::Directional) continue;
-                sLightDir    = glm::normalize(-ld.mDirection);   // surface->light
-                sLightColor  = glm::vec3(ld.mColor) * ld.mIntensity * colorScale;
-                sHasDirLight = true;
-                break;
+                if (ld.mType == LightType::Directional)
+                {
+                    if (sHasDirLight) continue;   // first directional only
+                    sLightDir    = glm::normalize(-ld.mDirection);   // surface->light
+                    sLightColor  = glm::vec3(ld.mColor) * ld.mIntensity * colorScale;
+                    sHasDirLight = true;
+                }
+                else if (sNumPointLights < kMaxDcPointLights)   // Point (and Spot -> point)
+                {
+                    DcPointLight& pl = sPointLights[sNumPointLights++];
+                    pl.pos    = ld.mPosition;
+                    pl.color  = glm::vec3(ld.mColor) * ld.mIntensity * colorScale;
+                    pl.radius = glm::max(ld.mRadius, 0.0001f);
+                }
             }
         }
     }
@@ -433,8 +473,20 @@ void GFX_CreateTextureResource(Texture* texture, std::vector<uint8_t>& data)
     if (srcW == 0 || srcH == 0 || px.size() < (size_t)srcW * srcH * 4)
         return;
 
-    // PVR needs power-of-two dimensions. Convert RGBA8888 -> ARGB1555 (5-bit
-    // colour + a 1-bit alpha for cutout, usable by the punch-through path later).
+    // Pick the pixel format from the source alpha. If any pixel has *partial*
+    // alpha (anti-aliased glyph/soft-mask edges), use ARGB4444 — 4-bit alpha (16
+    // levels) keeps those edges smooth. Otherwise ARGB1555 — 1-bit alpha but a
+    // 5-bit colour channel, sharper for opaque / hard-cutout art. Both are 16bpp
+    // so the twiddle + poly-context paths are identical; only the packing differs.
+    bool use4444 = false;
+    for (uint32_t sy = 0; sy < srcH && !use4444; ++sy)
+        for (uint32_t sx = 0; sx < srcW; ++sx)
+        {
+            const uint8_t a = px[((size_t)sy * srcW + sx) * 4 + 3];
+            if (a > 8 && a < 248) { use4444 = true; break; }
+        }
+
+    // PVR needs power-of-two dimensions. Convert RGBA8888 -> the chosen 16bpp format.
     const uint32_t w = DcNextPow2(srcW);
     const uint32_t h = DcNextPow2(srcH);
     uint16_t* conv = (uint16_t*)malloc((size_t)w * h * 2);
@@ -446,8 +498,14 @@ void GFX_CreateTextureResource(Texture* texture, std::vector<uint8_t>& data)
         {
             const uint32_t sx = (x < srcW) ? x : srcW - 1;
             const uint8_t* p = &px[((size_t)sy * srcW + sx) * 4];
-            const uint16_t a = (p[3] >= 128) ? 0x8000 : 0;
-            conv[(size_t)y * w + x] = (uint16_t)(a | ((p[0] >> 3) << 10) | ((p[1] >> 3) << 5) | (p[2] >> 3));
+            if (use4444)
+                conv[(size_t)y * w + x] = (uint16_t)(((p[3] >> 4) << 12) | ((p[0] >> 4) << 8) |
+                                                     ((p[1] >> 4) << 4)  |  (p[2] >> 4));
+            else
+            {
+                const uint16_t a = (p[3] >= 128) ? 0x8000 : 0;
+                conv[(size_t)y * w + x] = (uint16_t)(a | ((p[0] >> 3) << 10) | ((p[1] >> 3) << 5) | (p[2] >> 3));
+            }
         }
     }
 
@@ -467,6 +525,7 @@ void GFX_CreateTextureResource(Texture* texture, std::vector<uint8_t>& data)
     r->mHeight   = h;
     r->mBufWidth = w;
     r->mSwizzled = 1;   // twiddled (pvr_txr_load_ex twiddled it)
+    r->mPsm      = use4444 ? 1 : 0;   // format code read back by DcResolveTexture
     // Crop UVs to the real content within the padded POT texture.
     texture->SetUVMax(glm::vec2((float)srcW / (float)w, (float)srcH / (float)h));
 }
